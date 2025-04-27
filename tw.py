@@ -9,6 +9,8 @@ import zipfile
 import datetime
 import configparser
 import tempfile
+import subprocess
+from subprocess import CREATE_NEW_CONSOLE
 import requests
 
 # 🌐 Настройка Qt API
@@ -17,12 +19,13 @@ os.environ['QT_API'] = 'pyside6'
 APP_VERSION = "2.2.0"
 GITHUB_REPO   = "NorfaRu/NorfaTelemtry"
 
+from PySide6.QtCharts import QSplineSeries
 
 from collections import deque
 
-from PySide6.QtCore import QPropertyAnimation, QObject, QMetaObject
-from PySide6.QtGui  import QGuiApplication
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtCore import QEvent, QPropertyAnimation, QObject, QMetaObject
+from PySide6.QtGui  import QCursor, QGuiApplication
+from PySide6.QtWidgets import QToolTip, QMessageBox
 from PySide6.QtQuickWidgets import QQuickWidget
 from PySide6.QtCore import QUrl
 
@@ -43,7 +46,7 @@ from PySide6.QtWidgets import QPlainTextEdit, QComboBox
 
 # 🔄 Qt Core — Сигналы, Слоты, Таймеры, Потоки
 from qtpy.QtCore import (
-    Qt, QThread, Signal, Slot, QTimer, QRect
+    Qt, QThread, Signal, Slot, QPointF, QTimer, QRect
 )
 
 
@@ -359,6 +362,9 @@ class SplashScreen(QWidget):
 
     @Slot(str, str)
     def _prompt_update(self, latest, url):
+        from PySide6.QtWidgets import QMessageBox
+        from PySide6.QtGui     import QDesktopServices
+        from PySide6.QtCore    import QUrl
         mb = QMessageBox(self)
         mb.setWindowTitle("Доступно обновление")
         mb.setText(f"Найдена версия {latest} (у вас {APP_VERSION}). Обновиться?")
@@ -488,7 +494,7 @@ class TelemetryWorker(QThread):
     simulation_progress = Signal(int, int)
     def __init__(self, port_name="COM3", baud=9600, parent=None):
         super().__init__(parent)
-        import time
+        import math, time
         # Для Mahony AHRS
         self.qw, self.qx, self.qy, self.qz = 1.0, 0.0, 0.0, 0.0
         self.Kp, self.Ki = 1.0, 0.0   # Ki=0 → никакого «накопления»
@@ -612,8 +618,8 @@ class TelemetryWorker(QThread):
         print("[SIM] Simulation thread started")
         print(f"[SIM] run() started: initial sim_enabled={self.sim_enabled}, udp_enabled={self.udp_enabled}")
         buf = b""
-        self.log_ready.emit("Telemetry thread started. Version 2.2.0")
-        self.log_ready.emit("Надёжная версия: 2.2.0")
+        self.log_ready.emit("Telemetry thread started. Version 2.1 (Fix Update)")
+        self.log_ready.emit("Надёжная версия: 1.9")
 
         while self._running:
             try:
@@ -1771,6 +1777,7 @@ class LogPage(QWidget):
             # Запускаем фоновый поток для архивации
             self.add_log_message(f"[{datetime.datetime.now()}] Запуск экспорта ZIP...")
             if not os.path.isdir("log"):
+                self.add_log_message(f"[ERROR] Log directory missing: log")
                 return
             self._export_thread = ExportLogsThread(log_dir="log")
             self._export_thread.finished.connect(self._on_export_finished)
@@ -2485,6 +2492,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._start_simulation)
 
     def _start_simulation(self):
+        print("[UI] _start_simulation triggered")
         # 1) снимем паузу
         self.worker.resume()
         # 2) сбросим UI-буфер
@@ -2661,7 +2669,7 @@ class MainWindow(QMainWindow):
 
         # version
         if cmd == "version":
-            self.console.write_response("Grib Telemetry Dashboard v2.2.0 — program 'Norfa'")
+            self.console.write_response("Grib Telemetry Dashboard v2.1 — program 'grib'")
             return
 
         # pause/resume without data-check
