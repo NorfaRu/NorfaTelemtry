@@ -1,31 +1,33 @@
 # 📦 Стандартные библиотеки Python
 import os
 import sys
-import math
 import time
-import socket
 import struct
+import shutil
 import zipfile
 import datetime
+import socket
+import math
+import re
+import logging
+from typing import Optional, List, Tuple, Dict, Any, Union
+from collections import deque
 import configparser
-import tempfile
-import subprocess
-from subprocess import CREATE_NEW_CONSOLE
-import requests
+import webbrowser
 
 # 🌐 Настройка Qt API
 os.environ['QT_API'] = 'pyside6'
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
+STABLE_VERSION = "2.3.0"
 GITHUB_REPO   = "NorfaRu/NorfaTelemtry"
 
-from PySide6.QtCharts import QSplineSeries
+# ДЛЯ ТОГО ЧТОБЫ СОБРАТЬ ФАЙЛ В ТЕРМИНАЛЕ:
+# pyinstaller tw.py --onefile --windowed --icon=logo.ico --upx-dir=upx-5.0.0-win64
 
-from collections import deque
-
-from PySide6.QtCore import QEvent, QPropertyAnimation, QObject, QMetaObject
-from PySide6.QtGui  import QCursor, QGuiApplication
-from PySide6.QtWidgets import QToolTip, QMessageBox
+from PySide6.QtCore import QPropertyAnimation, QObject, QMetaObject
+from PySide6.QtGui  import QGuiApplication
+from PySide6.QtWidgets import QMessageBox
 from PySide6.QtQuickWidgets import QQuickWidget
 from PySide6.QtCore import QUrl
 
@@ -46,7 +48,7 @@ from PySide6.QtWidgets import QPlainTextEdit, QComboBox
 
 # 🔄 Qt Core — Сигналы, Слоты, Таймеры, Потоки
 from qtpy.QtCore import (
-    Qt, QThread, Signal, Slot, QPointF, QTimer, QRect
+    Qt, QThread, Signal, Slot, QTimer, QRect
 )
 
 
@@ -103,134 +105,297 @@ def version_tuple(v: str):
         return ()
 
 def check_for_update():
-    """Возвращает (True, download_url, latest_tag) если есть новая версия."""
-    try:
-        r = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest", timeout=3)
-        r.raise_for_status()
-        data = r.json()
-        latest = data.get("tag_name", "")
-        if latest and version_tuple(latest) > version_tuple(APP_VERSION):
-            for asset in data.get("assets", []):
-                if asset.get("name", "").lower().endswith(".exe"):
-                    return True, asset["browser_download_url"], latest
-    except Exception:
-        pass
-    return False, "", ""
+        """Возвращает (True, download_url, latest_tag) если есть новая версия."""
+        try:
+            # Use a slightly longer timeout and allow redirects
+            r = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest", timeout=5, allow_redirects=True)
+            r.raise_for_status() # Raises HTTPError for bad responses (4XX, 5XX)
+            data = r.json()
+            latest = data.get("tag_name", "")
+            # Ensure version comparison works even if tags have 'v' prefix
+            if latest and version_tuple(latest) > version_tuple(APP_VERSION):
+                for asset in data.get("assets", []):
+                    # Look specifically for .exe files
+                    if asset.get("name", "").lower().endswith(".exe"):
+                        url = asset.get("browser_download_url")
+                        if url:
+                            print(f"[Update] Found new version {latest} at {url}")
+                            return True, url, latest
+                        else:
+                            print("[Update] Found .exe asset but no download URL.")
+                print(f"[Update] Found new version {latest} but no suitable .exe asset.")
+            else:
+                 print(f"[Update] No new version found (Current: {APP_VERSION}, Latest on GitHub: {latest})")
+
+        except requests.exceptions.Timeout:
+            print("[Update Check Error] Request timed out.")
+        except requests.exceptions.ConnectionError as e:
+            print(f"[Update Check Error] Connection error: {e}")
+        except requests.exceptions.HTTPError as e:
+            print(f"[Update Check Error] HTTP error: {e.response.status_code} {e.response.reason}")
+        except requests.exceptions.JSONDecodeError:
+            print("[Update Check Error] Failed to parse JSON response from GitHub API.")
+        except Exception as e:
+            # Catch any other unexpected errors during the update check
+            print(f"[Update Check Error] An unexpected error occurred: {e}")
+
+        return False, "", ""
+
+import requests # Make sure requests is imported near the top
+import tempfile # Make sure tempfile is imported near the top
+import textwrap # Make sure textwrap is imported near the top
+import ctypes   # Make sure ctypes is imported near the top
 
 class UpdateThread(QThread):
-    # Добавляем сигнал для промежуточных шагов
-    # Сигнал для текстовых шагов
-    step     = Signal(str)
-    # Сигнал для прогресса: (загружено байт, всего байт)
-    progress = Signal(int, int)
-    finished = Signal(bool, str)  # (success, msg)
+        step = Signal(str)
+        progress = Signal(int, int)
+        finished = Signal(bool, str)  # (success, error_message)
+        # Signal emitted right before quitting the app to apply update
+        update_starting = Signal(str)
 
-    def __init__(self, download_url, parent=None):
-        super().__init__(parent)
-        self.download_url = download_url
+        def __init__(self, download_url, parent=None):
+            super().__init__(parent)
+            self.download_url = download_url
 
-    def run(self):
-        try:
-            # 1) Запрашиваем файл
-            print("[Updater] Запуск загрузки…")
-            self.step.emit("Начинаем загрузку обновления…")
-            r = requests.get(self.download_url, stream=True, timeout=15)
-            r.raise_for_status()
-
-            # 2) Записываем с отчётом по чанкам
+        def run(self):
             temp_dir = tempfile.gettempdir()
-            exe_path = os.path.join(temp_dir, "update.exe")
-            tmp_exe = open(exe_path, "wb")
-            print(f"[Updater] Сохраняю в {tmp_exe.name}")
-            # Скачиваем и сразу пишем в update.exe
-            for chunk in r.iter_content(8192):
-                if not chunk:
-                    continue
-                tmp_exe.write(chunk)
-            tmp_exe.close()
-            self.step.emit("Загрузка завершена")
-            print(f"[Updater] Итоговый размер: {os.path.getsize(exe_path)} байт")
+            # Use a more unique name for the downloaded file
+            timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+            new_exe_path = os.path.join(temp_dir, f"tw_update_{timestamp}.exe")
+            # Use PowerShell script instead of batch
+            updater_script_path = os.path.join(temp_dir, f"tw_updater_{timestamp}.ps1")
+            log_file_path = os.path.join(temp_dir, f"tw_update_{timestamp}.log") # Log for the script
 
-            # 3) Готовим батник для безопасной замены
-            self.step.emit("Подготавливаем установщик…")
-            current = sys.executable
-            # Тот же трюк для батника — читаем путь
-            bat_path = os.path.join(temp_dir, "update.bat")
-            bat = open(bat_path, "w", encoding="utf-8")
-            print(f"[Updater] Создаю батник {bat_path}")
-            bat_path = bat.name
-            print(f"[Updater] Создаю батник {bat_path}")
-            bat.write(f"""@echo off
-            :wait
-            tasklist /FI "IMAGENAME eq {os.path.basename(current)}" | findstr /I "{os.path.basename(current)}" >nul
-            if %ERRORLEVEL%==0 (
-                timeout /t 1 /nobreak >nul
-                goto wait
-            )
-            move /Y "{tmp_exe.name}" "{current}" >nul 2>&1
-            if exist "{current}" (
-                start "" "{current}"
-            ) else (
-                echo ERROR replacing file > "%~dp0update_error.log"
-            )
-            pause
-            exit
-            """)
-            bat.close()
-            print(f"[Updater] Батник записан. Содержимое:\n{open(bat_path, 'r', encoding='utf-8').read()}")
+            try:
+                # 1) Download the update
+                self.step.emit("Начинаем загрузку обновления…")
+                # Use requests for downloading as well, provides better control
+                with requests.get(self.download_url, stream=True, timeout=30, allow_redirects=True) as r:
+                    r.raise_for_status()
+                    total_size = int(r.headers.get('content-length', 0))
+                    downloaded_size = 0
 
-            self.step.emit("Запускаем установщик…")
-            # 3) Запускаем батник в новом консольном окне
-            print(f"[Updater] Запускаю батник {bat_path}")
-            # запускаем .bat с правами администратора
-            import ctypes
-            # ShellExecuteW возвращает >32 при успешном запуске
-            ctypes.windll.shell32.ShellExecuteW(
-                None,
-                "runas",                # verb: run as administrator
-                "cmd.exe",              # executable
-                f'/k "{bat_path}"',     # аргументы (/k — оставить окно)
-                None,
-                1                       # SW_SHOWNORMAL
-            )
-            self.step.emit("Установщик запущен")
-            self.finished.emit(True, "")
-            # всё успешно — приложение закроется и .bat подменит exe
-            self.step.emit("Обновление запущено, приложение перезапустится")
-            self.finished.emit(True, "")
+                    dl_mb = total_size / (1024 * 1024) if total_size else 0
+                    self.step.emit(f"Размер обновления: {dl_mb:.2f} МБ")
+
+                    with open(new_exe_path, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if chunk: # filter out keep-alive new chunks
+                                f.write(chunk)
+                                downloaded_size += len(chunk)
+                                if total_size > 0:
+                                    self.progress.emit(downloaded_size, total_size)
+
+                dl_done_mb = downloaded_size / (1024 * 1024)
+                self.step.emit(f"Загрузка завершена: {dl_done_mb:.2f} МБ")
+
+                # 2) Prepare the PowerShell updater script
+                self.step.emit("Подготовка установщика…")
+                # Determine the correct path for the current executable
+                if getattr(sys, 'frozen', False):
+                    # If running as a bundled app (pyinstaller)
+                    current_exe = sys.executable
+                else:
+                     # If running as a script
+                    current_exe = os.path.abspath(sys.argv[0])
+
+                pid = os.getpid()
+
+                powershell_script = textwrap.dedent(f"""
+                param(
+                    [Parameter(Mandatory=$true)][int]$PidToWait,
+                    [Parameter(Mandatory=$true)][string]$NewExePath,
+                    [Parameter(Mandatory=$true)][string]$TargetExePath,
+                    [Parameter(Mandatory=$true)][string]$LogFilePath
+                )
+
+                function Write-Log($message) {{
+                    "[{{0}}] $message" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') | Out-File -Append -Encoding UTF8 -FilePath $LogFilePath
+                }}
+
+                Write-Log "Updater script started."
+                Write-Log " - NewExe: $NewExePath"
+                Write-Log " - Target: $TargetExePath"
+                Write-Log " - Log: $LogFilePath"
+                Write-Log "Waiting for main process (PID: $PidToWait) to exit..."
+
+                $process = Get-Process -Id $PidToWait -ErrorAction SilentlyContinue
+                if ($process) {{
+                    Wait-Process -Id $PidToWait -Timeout 30 # Wait up to 30 seconds
+                    Start-Sleep -Milliseconds 500 # Brief pause after process *should* have exited
+                    $process = Get-Process -Id $PidToWait -ErrorAction SilentlyContinue # Check again
+                    if ($process) {{
+                        Write-Log "Error: Main process did not exit within 30 seconds. Attempting to terminate."
+                        try {{ Stop-Process -Id $PidToWait -Force -ErrorAction Stop }} catch {{ Write-Log "Failed to terminate process: $($_.Exception.Message)"}}
+                        Start-Sleep -Milliseconds 500 # Pause after trying termination
+                    }} else {{
+                         Write-Log "Main process exited."
+                    }}
+                }} else {{
+                    Write-Log "Main process (PID: $PidToWait) already exited or not found."
+                }}
+
+                # Extra check for file existence
+                if (-not (Test-Path $NewExePath)) {{
+                    Write-Log "Error: Downloaded file $NewExePath not found!"
+                    Exit 1
+                }}
+                 if (-not (Test-Path $TargetExePath)) {{
+                    Write-Log "Warning: Target file $TargetExePath not found (might be running from unexpected location?). Update will still proceed to place new file."
+                    # Consider if this case should abort
+                }}
+
+
+                Write-Log "Attempting to replace '$TargetExePath' with '$NewExePath'..."
+
+                try {{
+                    # Ensure target directory exists
+                    $TargetDir = Split-Path $TargetExePath -Parent
+                    if (-not (Test-Path $TargetDir)) {{
+                        Write-Log "Creating target directory: $TargetDir"
+                        New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null
+                    }}
+                    Move-Item -Path $NewExePath -Destination $TargetExePath -Force -ErrorAction Stop
+                    Write-Log "Update successful: '$TargetExePath' replaced."
+                }} catch {{
+                    Write-Log "Error replacing file: $($_.Exception.Message)"
+                    # Attempt to clean up the downloaded file even on error
+                    if (Test-Path $NewExePath) {{ Remove-Item -Path $NewExePath -Force -ErrorAction SilentlyContinue }}
+                    Write-Log "Update failed."
+                    Exit 1 # Indicate failure
+                }}
+
+                Write-Log "Attempting to start the new version: '$TargetExePath'"
+                try {{
+                    Start-Process -FilePath $TargetExePath -WorkingDirectory (Split-Path $TargetExePath -Parent) -ErrorAction Stop
+                    Write-Log "New version started."
+                }} catch {{
+                    Write-Log "Error starting new version: $($_.Exception.Message)"
+                    # Don't exit here, let the script clean up first
+                }}
+
+                Write-Log "Update process finished. Cleaning up updater script..."
+                # Self-delete the script
+                Remove-Item -Path $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
+                Exit 0 # Indicate success
+                """)
+
+                # Write the script file
+                with open(updater_script_path, "w", encoding="utf-8") as f:
+                    f.write(powershell_script)
+                self.step.emit("Установщик готов.")
+
+                # 3) Launch the PowerShell script (potentially elevated)
+                self.step.emit("Запуск установщика (может потребоваться разрешение Администратора)…")
+                try:
+                    # Command to execute: powershell.exe -ExecutionPolicy Bypass -File "<script_path>" -PidToWait <pid> -NewExePath "<new_exe>" -TargetExePath "<current_exe>" -LogFilePath "<log_path>"
+                    command_line = f'-ExecutionPolicy Bypass -File "{updater_script_path}" -PidToWait {pid} -NewExePath "{new_exe_path}" -TargetExePath "{current_exe}" -LogFilePath "{log_file_path}"'
+
+                    # Use ShellExecuteW to request elevation if needed ('runas')
+                    ret = ctypes.windll.shell32.ShellExecuteW(
+                        None,
+                        "runas",        # Verb: requests elevation
+                        "powershell.exe", # Executable
+                        command_line,   # Command line arguments
+                        None,           # Working directory (None for current)
+                        1               # Show command (SW_SHOWNORMAL)
+                    )
+
+                    # Check return code: > 32 indicates success in launching
+                    if ret > 32:
+                        self.step.emit("Установщик запущен. Приложение сейчас перезапустится.")
+                        # Emit signal *before* quitting
+                        self.update_starting.emit("Перезапуск для обновления...")
+                        # Initiate clean application shutdown
+                        QTimer.singleShot(500, QApplication.quit) # Short delay before quitting
+                    else:
+                        # User might have cancelled UAC prompt or other error
+                        error_code = ctypes.get_last_error() # Get error if ShellExecute failed intrinsically
+                        error_map = { 0: "The operating system is out of memory or resources.", 2: "The specified file was not found.", 3: "The specified path was not found.", 5: "Access denied.", 8: "Not enough memory resources are available to process this command.", 31: "No application is associated with the specified file name extension.", 1155: "No application is associated (alternate code).", 1223: "The operation was canceled by the user (UAC prompt)." }
+                        error_msg = f"Не удалось запустить установщик. Код ошибки: {ret} (WinErr: {error_code} - {error_map.get(error_code, 'Unknown error')})"
+                        print(f"[Update Error] {error_msg}")
+                        self.step.emit(error_msg)
+                        # Clean up downloaded file if script launch failed
+                        if os.path.exists(new_exe_path): os.remove(new_exe_path)
+                        if os.path.exists(updater_script_path): os.remove(updater_script_path)
+                        self.finished.emit(False, error_msg)
+
+                except Exception as e:
+                     # Catch errors during script launch preparation/execution call
+                    error_msg = f"Ошибка при запуске установщика: {e}"
+                    print(f"[Update Error] {error_msg}")
+                    self.step.emit(error_msg)
+                    # Clean up downloaded file
+                    if os.path.exists(new_exe_path): os.remove(new_exe_path)
+                    if os.path.exists(updater_script_path): os.remove(updater_script_path)
+                    self.finished.emit(False, error_msg)
+
+            except requests.exceptions.RequestException as e:
+                error_msg = f"Ошибка загрузки обновления: {e}"
+                print(f"[Update Error] {error_msg}")
+                self.step.emit(error_msg)
+                # Clean up potentially partially downloaded file
+                if os.path.exists(new_exe_path): os.remove(new_exe_path)
+                self.finished.emit(False, error_msg)
+            except IOError as e:
+                error_msg = f"Ошибка записи файла обновления: {e}"
+                print(f"[Update Error] {error_msg}")
+                self.step.emit(error_msg)
+                if os.path.exists(new_exe_path): os.remove(new_exe_path)
+                self.finished.emit(False, error_msg)
+            except Exception as e:
+                # Generic catch-all for other errors during the process
+                error_msg = f"Непредвиденная ошибка при обновлении: {e}"
+                print(f"[Update Error] {error_msg}")
+                self.step.emit(error_msg)
+                # Clean up any temp files if they exist
+                if os.path.exists(new_exe_path): os.remove(new_exe_path)
+                if os.path.exists(updater_script_path): os.remove(updater_script_path)
+                self.finished.emit(False, error_msg)
+
+@Slot(str, str)
+def _prompt_update(self, latest, url): # Keep url argument for compatibility, but don't use it directly for download
+    mb = QMessageBox(self)
+    mb.setWindowTitle("Доступно обновление")
+    mb.setText(f"Найдена версия {latest} (у вас {APP_VERSION}). Открыть страницу загрузки?") # Changed text slightly
+    mb.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+    reply = mb.exec()
+    if reply == QMessageBox.Yes:
+        # Open the GitHub releases page in the browser
+        releases_url = f"https://github.com/{GITHUB_REPO}/releases"
+        print(f"[Splash] Opening GitHub releases page: {releases_url}")
+        try:
+            webbrowser.open(releases_url)
+            self.loading_step.emit("Открываем страницу загрузки в браузере…") # Update status briefly
         except Exception as e:
-            print(f"[Updater] Ошибка: {e}")
-            self.step.emit(f"Ошибка при обновлении: {e}")
-            self.finished.emit(False, str(e))
+            print(f"[Splash] Error opening browser: {e}")
+            QMessageBox.warning(self, "Ошибка", f"Не удалось открыть браузер. Посетите:\n{releases_url}")
+        # Proceed to launch the main application after opening the browser or showing error
+        self._launch_main()
 
-    @Slot(str, str)
-    def _prompt_update(self, latest, url):
-        print(f"[Splash] Запрашиваем у пользователя обновиться до {latest}…")
-
-        mb = QMessageBox(self)
-        mb.setWindowTitle("Доступно обновление")
-        mb.setText(f"Найдена версия {latest} (у вас {APP_VERSION}). Обновиться?")
-        mb.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        reply = mb.exec()
-
-        if reply == QMessageBox.Yes:
-            print("[Splash] Пользователь согласился.")
-            self.update_pb.setValue(0)
-            self.update_pb.show()
-
-            self.upd_thread = UpdateThread(url)
-            self.upd_thread.step.connect(lambda txt: print(f"[Updater] {txt}") or self.loading_step.emit(txt))
-            self.upd_thread.progress.connect(
-                lambda d, t: ( print(f"[Updater] Прогресс {d}/{t}"),
-                              self.update_pb.setValue(int(d*100/t) if t else 0) )[1]
-            )
-            self.upd_thread.finished.connect(lambda *_: self.update_pb.hide())
-            self.upd_thread.finished.connect(self._on_update_finished)
-            print("[Splash] Запускаем UpdateThread…")
-            self.upd_thread.start()
-        else:
-            print("[Splash] Пользователь отказался.")
-            self._launch_main()
+        # Remove the old UpdateThread logic:
+        # # Сбросить прогресс и показать бар
+        # self.update_pb.setValue(0)
+        # self.update_pb.show()
+        #
+        # self.upd_thread = UpdateThread(url) # url is the specific asset download URL, which we no longer use directly here
+        # # текстовые шаги на статус-лейбл
+        # self.upd_thread.step.connect(self.loading_step)
+        # # обновление прогресса
+        # self.upd_thread.progress.connect(
+        #     lambda done, total: self.update_pb.setValue(int(done * 100 / total) if total else 0)
+        # )
+        # # по завершении *неудачного* обновления — скрыть прогресс-бар и показать ошибку
+        # self.upd_thread.finished.connect(self._on_update_finished)
+        # # Когда скрипт обновления запущен, показать сообщение перед выходом
+        # self.upd_thread.update_starting.connect(self.loading_step) # Update status label
+        # # Add a specific connection for the final message before quit
+        # self.upd_thread.update_starting.connect(lambda msg: print(f"[Splash] {msg}"))
+        # self.upd_thread.start()
+        # # Don't return here, let the splash screen stay visible until update starts or fails
+    else:
+        print("[Splash] Пользователь отказался от обновления, запускаем приложение.")
+        self._launch_main()
 
 class SpinnerWidget(QWidget):
     def __init__(self, parent=None, radius=20, line_width=4):
@@ -272,8 +437,9 @@ class SpinnerWidget(QWidget):
 class SplashScreen(QWidget):
     loading_step = Signal(str)      # сигнал для обновления текста
 
-    def __init__(self):
+    def __init__(self, config=None):
         super().__init__()
+        self.config = config or {}
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
 
@@ -330,7 +496,7 @@ class SplashScreen(QWidget):
         self.loading_step.connect(self.status_label.setText)
 
         # + Создаём MainWindow сразу в главном потоке (но не показываем)
-        self.main = MainWindow()
+        self.main = MainWindow(self.config)  # Передаем конфигурацию в MainWindow
         # + Теперь запускаем фоновые задачи (только не-UI!) через InitWorker
         QTimer.singleShot(100, self._start_initialization)
 
@@ -362,31 +528,23 @@ class SplashScreen(QWidget):
 
     @Slot(str, str)
     def _prompt_update(self, latest, url):
-        from PySide6.QtWidgets import QMessageBox
-        from PySide6.QtGui     import QDesktopServices
-        from PySide6.QtCore    import QUrl
         mb = QMessageBox(self)
         mb.setWindowTitle("Доступно обновление")
-        mb.setText(f"Найдена версия {latest} (у вас {APP_VERSION}). Обновиться?")
+        mb.setText(f"Найдена версия {latest} (у вас {APP_VERSION}). Открыть страницу загрузки?")
         mb.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
         reply = mb.exec()
         if reply == QMessageBox.Yes:
-            # Сбросить прогресс и показать бар
-            self.update_pb.setValue(0)
-            self.update_pb.show()
-
-            self.upd_thread = UpdateThread(url)
-            # текстовые шаги на статус-лейбл
-            self.upd_thread.step.connect(self.loading_step)
-            # обновление прогресса
-            self.upd_thread.progress.connect(
-                lambda done, total: self.update_pb.setValue(int(done * 100 / total) if total else 0)
-            )
-            # по завершении — скрыть прогресс-бар
-            self.upd_thread.finished.connect(lambda *_: self.update_pb.hide())
-            self.upd_thread.finished.connect(self._on_update_finished)
-            self.upd_thread.start()
-            return
+            # Open the GitHub releases page in the browser
+            releases_url = f"https://github.com/{GITHUB_REPO}/releases"
+            print(f"[Splash] Opening GitHub releases page: {releases_url}")
+            try:
+                webbrowser.open(releases_url)
+                self.loading_step.emit("Открываем страницу загрузки в браузере…")
+            except Exception as e:
+                print(f"[Splash] Error opening browser: {e}")
+                QMessageBox.warning(self, "Ошибка", f"Не удалось открыть браузер. Посетите:\n{releases_url}")
+            # Proceed to launch the main application after opening the browser or showing error
+            self._launch_main()
         else:
             print("[Splash] Пользователь отказался от обновления, запускаем приложение.")
             self._launch_main()
@@ -408,10 +566,15 @@ class SplashScreen(QWidget):
 
     @Slot(bool, str)
     def _on_update_finished(self, success: bool, msg: str):
-        print(f"[Splash] UpdateThread завершился: success={success}, msg={msg}")
+        print(f"[Splash] UpdateThread finished signal received: success={success}, msg={msg}")
+        self.update_pb.hide()
         if not success:
             QMessageBox.critical(self, "Ошибка обновления", msg)
-        QApplication.quit()
+            # If update failed, proceed to launch the current version
+            print("[Splash] Update failed, launching current version.")
+            self._launch_main()
+        # If success=True, it means the script was launched and the app will quit separately via update_starting signal + QTimer.
+        # No need to call _launch_main() here in the success case.
 
     def _launch_main(self):
         print("[SplashScreen] Переходим к главному окну.")
@@ -492,9 +655,12 @@ class TelemetryWorker(QThread):
     error_crc     = Signal()
     sim_ended     = Signal()
     simulation_progress = Signal(int, int)
-    def __init__(self, port_name="COM3", baud=9600, parent=None):
+    def __init__(self, config, port_name="COM3", baud=9600, parent=None):
         super().__init__(parent)
-        import math, time
+        self.config = config
+        self.packet_format = config["packet_structure"]["format"]
+        self.fields = config["packet_structure"]["fields"]
+        import time
         # Для Mahony AHRS
         self.qw, self.qx, self.qy, self.qz = 1.0, 0.0, 0.0, 0.0
         self.Kp, self.Ki = 1.0, 0.0   # Ki=0 → никакого «накопления»
@@ -618,8 +784,8 @@ class TelemetryWorker(QThread):
         print("[SIM] Simulation thread started")
         print(f"[SIM] run() started: initial sim_enabled={self.sim_enabled}, udp_enabled={self.udp_enabled}")
         buf = b""
-        self.log_ready.emit("Telemetry thread started. Version 2.1 (Fix Update)")
-        self.log_ready.emit("Надёжная версия: 1.9")
+        self.log_ready.emit(f"Telemetry thread started. Version {APP_VERSION}")
+        self.log_ready.emit(f"Надёжная версия: {STABLE_VERSION}")
 
         while self._running:
             try:
@@ -663,40 +829,43 @@ class TelemetryWorker(QThread):
                 if buf[:2] == b"\xAA\xAA":
                     chunk = buf[:60]
                     try:
-                        pkt = struct.unpack(STRUCT_FMT, chunk)
+                        pkt = struct.unpack(self.packet_format, chunk)
                     except struct.error:
                         buf = buf[1:]
                         continue
                     if self.xor_block(chunk[:-1]) == pkt[-1]:
                         try:
-                            data = {
-                                "packet_num": pkt[12],
-                                "timestamp": pkt[2],
-                                "temp_bmp": pkt[3]/100,
-                                "press_bmp": pkt[4],
-                                "accel": [v*488/1000/1000 for v in pkt[5:8]],
-                                "gyro": [v*70/1000 for v in pkt[8:11]],
-                                "state": pkt[13] & 0x07,
-                                "photo": pkt[14]/1000,
-                                "mag": [v/1711 for v in pkt[15:18]],
-                                "temp_ds": pkt[18]/16,
-                                "gps": tuple(pkt[19:22]),
-                                "gps_fix": pkt[22],
-                                "scd41": pkt[23],
-                                "mq4": pkt[24],
-                                "me2o2": pkt[25],
-                                "crc": pkt[-1]
-                            }
+                            # Динамическое формирование данных на основе конфигурации
+                            data = {}
+                            for field in self.fields:
+                                if field["type"] == "vector3":
+                                    indices = field["indices"]
+                                    scale = field.get("scale", 1.0)
+                                    data[field["name"]] = [pkt[i]*scale for i in indices]
+                                elif field["type"] == "float":
+                                    index = field["index"]
+                                    scale = field.get("scale", 1.0)
+                                    data[field["name"]] = pkt[index]*scale
+                                elif field["type"] == "int" and "mask" in field:
+                                    index = field["index"]
+                                    mask = field["mask"]
+                                    data[field["name"]] = pkt[index] & mask
+                                elif field["type"] == "int":
+                                    index = field["index"]
+                                    data[field["name"]] = pkt[index]
+                                # ... другие типы ...
+                        
+                            # ... остальной код обработки ...
+                            self.data_ready.emit(data)
+                            self.last_data_time = time.time()
+                            if self.f_csv and not self.f_csv.closed:
+                                self.f_csv.write(";".join(str(x) for x in pkt) + "\n")
+                            self.f_bin.write(chunk)
+                            buf = buf[60:]
                         except Exception as e:
                             self.log_ready.emit(f"[ERROR] Ошибка парсинга пакета: {e}")
                             buf = buf[60:]
                             continue
-                        self.data_ready.emit(data)
-                        self.last_data_time = time.time()
-                        if self.f_csv and not self.f_csv.closed:
-                            self.f_csv.write(";".join(str(x) for x in pkt) + "\n")
-                        self.f_bin.write(chunk)
-                        buf = buf[60:]
                     else:
                         self.error_crc.emit()
                         mw = QApplication.activeWindow()
@@ -808,123 +977,102 @@ def apply_dark_theme(app: QApplication):
         }}
     """)
 
-
 # === СТРАНИЦА ТЕЛЕМЕТРИИ + ГРАФИКИ ===
 class TelemetryPage(QWidget):
-    def __init__(self):
+    def __init__(self, config):
         super().__init__()
-        self._last_tooltip = 0.0
+        self.config = config
+        self._last_values = {}
+        
         layout = QGridLayout(self)
         layout.setSpacing(12)
-        # ... (весь код карточек без изменений) ...
+        
+        # --- кнопка Пауза/Возобновить ---
         self.pause_btn = QPushButton("⏸ Пауза")
-        self.pause_btn.setFixedHeight(40)
         self.pause_btn.setEnabled(False)
-        self.pause_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {COLORS["btn_normal"]};
-                color: {COLORS["text_primary"]};
-                border-radius: 6px;
-                font-size: 11pt;
-                font-weight: bold;
-            }}
-            QPushButton:hover {{ background: {COLORS["btn_hover"]}; }}
-            QPushButton:pressed {{ background: {COLORS["btn_active"]}; }}
-        """)
         self.pause_btn.clicked.connect(self.toggle_pause)
         layout.addWidget(self.pause_btn, 0, 0, 1, 2)
-
-        self.cards = {}
-        self._last_values = {}
-        labels = [
-            ("Номер пакета",    "packet_num"),
-            ("Время, мс",       "timestamp"),
-            ("Темп BMP, °C",    "temp_bmp"),
-            ("Давл BMP, Па",    "press_bmp"),
-            ("Ускор (X Y Z)",   "accel"),
-            ("Угл.скор (X Y Z)","gyro"),
-            ("Сост.аппарата",   "state"),
-            ("Фото.рез, В",     "photo"),
-            ("Магн.поле (X Y Z)","mag"),
-            ("Темп DS18, °C",   "temp_ds"),
-            ("GPS (lat lon h)", "gps"),
-            ("GPS fix",         "gps_fix"),
-            ("SCD41",           "scd41"),
-            ("MQ-4, ppm",       "mq4"),
-            ("ME2-O2, ppm",     "me2o2"),
-            ("Контр.сумма",     "crc")
-        ]
-        for i, (title, key) in enumerate(labels):
+        
+        # --- динамические поля из config["telemetry_view"] ---
+        self._label_widgets = {}
+        row = 1
+        col = 0
+        
+        for f in config.get("telemetry_view", {}).get("fields", []):
             card = QFrame()
             card.setObjectName("card")
-            # включаем hover-события и фильтр
-            card.setAttribute(Qt.WA_Hover, True)
-            card.installEventFilter(self)
-            shadow = QGraphicsDropShadowEffect(card)
-            shadow.setBlurRadius(12)
-            shadow.setOffset(0, 4)
-            shadow.setColor(QColor(0, 0, 0, 80))
-            card.setGraphicsEffect(shadow)
-
-            v = QVBoxLayout(card)
-            v.setContentsMargins(10, 8, 10, 8)
-            t = QLabel(title, objectName="title")
-            val = QLabel("-", objectName="value")
-            card.setToolTipDuration(1000)
-            card.setToolTip(f"{title}: -")
-            val.setContextMenuPolicy(Qt.CustomContextMenu)
-            val.customContextMenuRequested.connect(
-                lambda pos, w=val: w.copy() if hasattr(w, 'copy') else QApplication.clipboard().setText(w.text())
-            )
-            val.setAlignment(Qt.AlignCenter)
-            val.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            v.addWidget(t); v.addWidget(val)
-            layout.addWidget(card, i//2 + 1, i%2)
-            self.cards[key] = val
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(10, 8, 10, 8)
+            
+            title = QLabel(f.get("label", ""), objectName="title")
+            value = QLabel("–", objectName="value")
+            
+            value.setAlignment(Qt.AlignCenter)
+            value.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            
+            card_layout.addWidget(title)
+            card_layout.addWidget(value)
+            
+            layout.addWidget(card, row, col)
+            self._label_widgets[f["source"]] = (value, f)
+            
+            # Move to next column or row
+            col = (col + 1) % 2
+            if col == 0:
+                row += 1
 
     @Slot(dict)
     def update_values(self, data):
-        self._last_values = data.copy()
+        self._last_values = data.copy() if data else {}
+
         if not self.pause_btn.isEnabled():
             self.pause_btn.setEnabled(True)
-        for k, w in self.cards.items():
-            if k in data:
-                v = data[k]
-                self._last_values[k] = data[k]
-                w.setText(
-                    ", ".join(f"{x:.2f}" for x in v)
-                    if isinstance(v, (list, tuple))
-                    else (f"{v:.2f}" if isinstance(v, float) else str(v))
-                )
 
-    @Slot(dict)
-    def update_chart(self, data):
-        # Температура
-        t = data.get("temp_bmp", 0.0)
-        self.series_temp.append(self.temp_index, t)
-        self.temp_index += 1
-        if self.series_temp.count() > 100:
-            self.series_temp.remove(0)
-        # Ускорение
-        a = data.get("accel", [0,0,0])
-        mag = math.sqrt(a[0]**2 + a[1]**2 + a[2]**2)
-        self.series_acc.append(self.acc_index, mag)
-        self.acc_index += 1
-        if self.series_acc.count() > 100:
-            self.series_acc.remove(0)
+        for src, (label, field) in self._label_widgets.items():
+            val = data.get(src)
+            # Get the format string from the field config, default to '{}'
+            fmt = field.get("format", "{}")
+            text_to_set = "–" # Default text if value is None
+
+            if val is not None:
+                try:
+                    if isinstance(val, (list, tuple)):
+                        # Attempt to format the list/tuple using the provided format string
+                        # This assumes the format string is compatible (e.g., "[{:.2f}, {:.2f}, {:.2f}]")
+                        # A more robust solution might involve parsing the format string.
+                        # For now, try direct formatting, fallback to simple join.
+                        try:
+                            # Special case for list/tuple: unpack elements if format allows
+                            text_to_set = fmt.format(*val)
+                        except (TypeError, IndexError):
+                            # Fallback if format string expects a single value or wrong number of args
+                            text_to_set = ", ".join(str(x) for x in val) # Original simple join
+                    elif isinstance(val, (int, float)):
+                        # Format single number
+                        text_to_set = fmt.format(val)
+                    else:
+                        # Fallback for other types (string, bool, etc.)
+                        text_to_set = fmt.format(val) # Try formatting anyway
+                except Exception as e:
+                    # Catch potential formatting errors (e.g., trying to format a non-number with {:.2f})
+                    print(f"[TelemetryPage] Error formatting value for {src} (value: {val}, format: {fmt}): {e}")
+                    text_to_set = f"Err: {val}" # Show error indicator instead of crashing
+
+            # Update the label text
+            label.setText(text_to_set)
 
     @Slot()
     def toggle_pause(self):
         if hasattr(self, 'worker'):
             if self.worker.is_paused():
-                self.worker.resume();    self.pause_btn.setText("⏸ Пауза")
+                self.worker.resume()
+                self.pause_btn.setText("⏸ Пауза")
             else:
-                self.worker.pause();     self.pause_btn.setText("▶ Продолжить")
+                self.worker.pause()
+                self.pause_btn.setText("▶ Продолжить")
 
     def set_worker(self, worker):
         self.worker = worker
-
-        # + Replace the GraphsPage class with this enhanced version
 
 class DraggableCard(QFrame):
     def __init__(self, parent=None):
@@ -970,9 +1118,12 @@ class DraggableCard(QFrame):
         ev.acceptProposedAction()
 
 class GraphsPage(QWidget):
-    def __init__(self):
+    def __init__(self, config):
         super().__init__()
+        self.config = config
         self._orig_pos = {}
+        # Map series names to QLineSeries for updates
+        self.series = {}
         layout = QGridLayout(self)
         self._detached_windows = {}
         # === System Monitor ===
@@ -996,7 +1147,7 @@ class GraphsPage(QWidget):
         self.sys_timer.start(1000)
         # Оборачиваем сетку в прокручиваемую область
         scroll = QScrollArea(self)
-        scroll.setWidgetResizable(True)
+        scroll.setWidgetResizable(True) # Revert to standard behavior
         content = QWidget()
         layout = QGridLayout(content)
         self.setLayout(QVBoxLayout())
@@ -1004,6 +1155,12 @@ class GraphsPage(QWidget):
         scroll.setWidget(content)
         layout.setSpacing(12)
         self._grid_layout = self.findChild(QScrollArea).widget().layout()
+
+        # Make the first two columns stretch equally
+        self._grid_layout.setColumnStretch(0, 1)
+        self._grid_layout.setColumnStretch(1, 1)
+        # Explicitly prevent stretching of subsequent columns
+        self._grid_layout.setColumnStretch(2, 0)
 
         # ежеминутный сброс, чтобы QLineSeries/ QSplineSeries не росли в C++
         self._cleanup_timer = QTimer(self)
@@ -1019,66 +1176,47 @@ class GraphsPage(QWidget):
         self.last_extreme     = {}      # Имя -> время последнего выхода за пределы
         self.extreme_decay    = 5.0     # секунд до сброса к дефолтному диапазону
 
-        # Define all the charts we want to display
-        chart_configs = [
-            {"name": "temp_bmp", "title": "Температура BMP, °C", "color": "#5cceee", "y_range": [0, 40]},
-            {"name": "press_bmp", "title": "Давление, Па", "color": "#ff9e80", "y_range": [80000, 110000]},
-            {"name": "accel", "title": "Ускорение, g", "color": "#7bed9f", "y_range": [0, 3], "multi_axis": True,
-             "axis_names": ["X", "Y", "Z"]},
-            {"name": "gyro", "title": "Угловая скорость, °/с", "color": "#ffeb3b", "y_range": [-180, 180], "multi_axis": True,
-             "axis_names": ["X", "Y", "Z"]},
-            {"name": "mag", "title": "Магнитное поле", "color": "#ba68c8", "y_range": [-1, 1], "multi_axis": True,
-             "axis_names": ["X", "Y", "Z"]},
-            {"name": "temp_ds", "title": "Температура DS18B20, °C", "color": "#4db6ac", "y_range": [0, 40]},
-            {"name": "photo", "title": "Фоторезистор, В", "color": "#fff176", "y_range": [0, 5]},
-            {"name": "scd41", "title": "SCD41 (CO₂), ppm", "color": "#aed581", "y_range": [0, 2000]},
-            {"name": "mq4", "title": "MQ-4 (CH₄), ppm", "color": "#f48fb1", "y_range": [0, 1000]},
-            {"name": "me2o2", "title": "ME2-O2, ppm", "color": "#90caf9", "y_range": [0, 25]}
-        ]
+        # --- Load Saved Layout ---
+        self._loaded_layout = {}
+        try:
+            cfg_parser = configparser.ConfigParser()
+            # Read config.ini, ensuring the file exists
+            if os.path.exists("config.ini"):
+                cfg_parser.read("config.ini")
+                if cfg_parser.has_section("Layout") and cfg_parser.has_option("Layout", "chart_positions"):
+                    pos_str = cfg_parser.get("Layout", "chart_positions")
+                    # Parse "name1:row1:col1,name2:row2:col2,..."
+                    for item in pos_str.split(','):
+                        parts = item.split(':')
+                        if len(parts) == 3:
+                            name, r_str, c_str = parts
+                            try:
+                                self._loaded_layout[name] = (int(r_str), int(c_str))
+                            except ValueError:
+                                print(f"[GraphsPage] Warning: Invalid position '{r_str}:{c_str}' for chart '{name}' in config.ini")
+                    print(f"[GraphsPage] Loaded layout: {self._loaded_layout}") # Debug print
+                else:
+                    print("[GraphsPage] No saved layout found in config.ini.")
+            else:
+                print("[GraphsPage] config.ini not found, using default layout.")
+        except configparser.Error as e:
+            print(f"[GraphsPage] Error reading config.ini for layout: {e}")
+        except Exception as e:
+            print(f"[GraphsPage] Unexpected error loading layout: {e}")
 
-        # — load saved order —
-        import configparser
-        cfg = configparser.ConfigParser()
-        cfg.read("config.ini")
-        pos_map = {}
-        if cfg.has_option("Layout", "chart_positions"):
-            for token in cfg.get("Layout", "chart_positions").split(","):
-                token = token.strip()
-                # пропускаем пустые или некорректные записи
-                if not token or token.count(":") != 2:
-                    continue
-                name, rs, cs = token.split(":")
-                try:
-                    pos_map[name] = (int(rs), int(cs))
-                except ValueError:
-                    # если не числа — пропустить
-                    continue
-
-        # Добавляем виджеты по сохранённым позициям, а незаписанные — в конец
-        used = set()
-        for config in chart_configs:
-            name = config["name"]
-            if name in pos_map:
-                r, c = pos_map[name]
-                w = self.create_chart(config)
-                layout.addWidget(w, r, c)
-                used.add(name)
-
-        # Create charts
-        row, col = 0, 0
-        columns = 2  # Теперь две колонки вместо трех
-        for config in chart_configs:
-            name = config["name"]
-            if name in used:
-                continue
-            w = self.create_chart(config)
-
-            while layout.itemAtPosition(row, col) is not None:
-                    col += 1
-                    if col >= columns:
-                        col = 0
-                        row += 1
-            layout.addWidget(w, row, col)
+        # Создаём графики по секции "graphs" из конфигурации (tw_config.py)
+        for cfg in self.config.get("graphs", []):
+            wrapper = self.create_chart(cfg)
+            size = cfg.get("size", [1, 1])
+            # Use loaded position if available, otherwise default from config
+            chart_name = cfg.get("name")
+            if chart_name in self._loaded_layout:
+                pos = self._loaded_layout[chart_name]
+                print(f"[GraphsPage] Using saved position {pos} for '{chart_name}'") # Debug print
+            else:
+                pos = cfg.get("position", [0, 0]) # Default position from config
+                print(f"[GraphsPage] Using default position {pos} for '{chart_name}'") # Debug print
+            self._grid_layout.addWidget(wrapper, pos[0], pos[1], size[0], size[1])
 
     def reset_charts(self):
             """Полностью очистить графики и вернуть их в дефолт."""
@@ -1122,11 +1260,25 @@ class GraphsPage(QWidget):
             self.lat_label.setText(lat_text)
 
     def create_chart(self, config):
-        """Create a chart based on configuration"""
+        # Получаем заголовок из конфигурации, с поддержкой и старого, и нового формата
+        title = config.get("title", config.get("name", "График"))
+        
+        # Диапазон Y - поддерживаем как старый формат (y_range), так и новый (y_min/y_max)
+        if "y_range" in config:
+            y_range = config["y_range"]
+        else:
+            # Используем y_min/y_max если они есть, иначе дефолтные значения
+            y_min = config.get("y_min", 0)
+            y_max = config.get("y_max", 100)
+            y_range = (y_min, y_max)
+        
+        # Цвет графика
+        color = config.get("color", "#4fc3f7")  # Дефолтный цвет
+        
+        # Тип графика
+        chart_type = config.get("type", "line")  # Дефолтный тип - линейный
+        
         name = config["name"]
-        title = config["title"]
-        color = config["color"]
-        y_range = config["y_range"]
         multi_axis = config.get("multi_axis", False)
         axis_names = config.get("axis_names", ["X", "Y", "Z"])
 
@@ -1214,15 +1366,21 @@ class GraphsPage(QWidget):
 
                 series_list.append(series)
 
+            # Register in charts and series dicts
             self.charts[name] = {
-                "view": None,  # Will be set below
+                "view": None,
                 "chart": chart,
                 "series": series_list,
                 "x_axis": ax_x,
                 "y_axis": ax_y,
                 "multi_axis": True,
-                "y_range": y_range  # + Сохраняем исходный диапазон
+                "y_range": y_range
             }
+            # Populate series mapping for updates
+            for i, s in enumerate(series_list):
+                key = f"{name}_{i}"
+                self.series[key] = s
+                self.indexes[key] = 0
         else:
             # For single value data
             series = QLineSeries()
@@ -1237,15 +1395,19 @@ class GraphsPage(QWidget):
             series.attachAxis(ax_x)
             series.attachAxis(ax_y)
 
+            # Register in charts and series dicts
             self.charts[name] = {
-                "view": None,  # Will be set below
+                "view": None,
                 "chart": chart,
                 "series": series,
                 "x_axis": ax_x,
                 "y_axis": ax_y,
                 "multi_axis": False,
-                "y_range": y_range  # + Сохраняем исходный диапазон
+                "y_range": y_range
             }
+            # Populate series mapping for updates
+            self.series[name] = series
+            self.indexes[name] = 0
 
         # Create chart view with enhanced rendering
         chart_view = QChartView(chart)
@@ -1255,7 +1417,8 @@ class GraphsPage(QWidget):
         chart_view.setRenderHint(QPainter.TextAntialiasing)
         chart_view.setRenderHint(QPainter.SmoothPixmapTransform)
         chart_view.setBackgroundBrush(Qt.transparent)
-        chart_view.setMinimumHeight(250)
+        # Set a reasonable minimum size for charts
+        chart_view.setMinimumSize(300, 250) 
 
         # wrap into card for rounded background
         wrapper = DraggableCard()
@@ -1390,7 +1553,7 @@ class GraphsPage(QWidget):
             # reset flags
             wrapper.setProperty("detached", False)
             wrapper.setProperty("detached_win", None)
-            # show the original Detach (“⇱”) button
+            # show the original Detach ("⇱") button
             for btn in wrapper.findChildren(QPushButton):
                 if btn.toolTip() == "Open chart in separate window":
                     btn.show()
@@ -1502,110 +1665,121 @@ class GraphsPage(QWidget):
 
     @Slot(dict)
     def update_charts(self, data):
-        import time
-        now = time.time()
-        if not hasattr(self, '_last_chart_update'):
-            self._last_chart_update = 0
-        # не чаще 20 FPS
-        if now - self._last_chart_update < 0.05:
-            return
-        self._last_chart_update = now
-        """Update all charts with new data"""
-        for name, chart_data in self.charts.items():
-            if name not in data:
+
+        # Update each configured chart
+        for graph_config in self.config.get("graphs", []):
+            name = graph_config.get("name")
+            chart_data = self.charts.get(name)
+            if not chart_data:
                 continue
-            # если вдруг нет default range — установить
-            if name not in self.default_y_ranges:
-                self.default_y_ranges[name] = tuple(chart_data["y_range"])
 
             chart_view = chart_data["view"]
-            # блокируем перерисовку на время всех изменений
-            chart_view.setUpdatesEnabled(False)
-
-            chart_view = chart_data["view"]
-
-            # + Блокируем обновления для предотвращения мерцания (без падений)
+            # Disable updates temporarily to prevent flicker
             try:
                 chart_view.setUpdatesEnabled(False)
             except RuntimeError:
-                # объект уже удалён на C++ стороне
-                continue
+                pass # View might be closed
 
-            # ← вернуть определение переменных для обновления
-            value      = data.get(name)
-            index      = self.indexes.get(name, 0)
-            x_axis     = chart_data["x_axis"]
             max_points = self.data_points.get(name, 200)
-            # Check if this is a multi-axis chart
-            if chart_data.get("multi_axis", False):
-                # Multi-axis data (accel, gyro, mag)
-                series_list = chart_data["series"]
+            x_axis = chart_data["x_axis"]
+            current_count = 0
 
-                if isinstance(value, list) and len(value) >= 3:
-                    data_values = []
-
-                    for i in range(3):
-                        series = series_list[i]
+            # --- Multi-axis charts (use 'sources' key) --- 
+            if chart_data.get("multi_axis", False) and "sources" in graph_config:
+                values = []
+                # Extract each value from the sources list
+                for raw_src in graph_config["sources"]:
+                    val = None
+                    if '[' in raw_src and ']' in raw_src:
+                        base, idx_str = raw_src.split('[')
+                        idx = int(idx_str.rstrip(']'))
+                        arr = data.get(base)
+                        if isinstance(arr, (list, tuple)) and len(arr) > idx:
+                            val = arr[idx]
+                    else:
+                        val = data.get(raw_src)
+                    values.append(val if val is not None else 0)
+                
+                # Update series and enforce window
+                if len(values) == len(chart_data["series"]):
+                    for i, series in enumerate(chart_data["series"]):
                         if series.count() >= max_points:
-                            # быстро удаляем первые лишние точки
                             remove_cnt = series.count() - max_points + 1
                             series.removePoints(0, remove_cnt)
-
-                        # Add new point
-                        series.append(series.count(), value[i])
-                        data_values.append(value[i])
-
-                    # + Обновляем историю данных для автомасштабирования
-                    history = self.data_history.get(name, [])
-                    history.extend(data_values)
-                    # Ограничиваем количество сохраненных точек
-                    max_history = max_points * 3  # Храним максимум в 3 раза больше точек чем отображаем
-                    if len(history) > max_history:
-                        del history[:-max_history]
-                    self.data_history[name] = history
-
-                    # Auto-scale Y axis based on all three values
-                    self.auto_scale_y_axis(name, data_values)
-
-            else:
-                # Single-value data
-                series = chart_data["series"]
-
-                if isinstance(value, (int, float)):
+                        series.append(series.count(), values[i])
+                    current_count = chart_data["series"][0].count()
+                
+                    # Update history and autoscale
+                    hist = self.data_history.setdefault(name, [])
+                    hist.extend(values)
+                    max_hist = max_points * 3 * len(values)
+                    if len(hist) > max_hist:
+                        hist[:] = hist[-max_hist:]
+                    # Autoscale based on the new values added
+                    self.auto_scale_y_axis(name, values)
+            
+            # --- Single-value charts (use 'source' key) ---
+            elif "source" in graph_config:
+                val = None
+                raw_src = graph_config["source"]
+                # Handle indexed sources like accel[0]
+                if '[' in raw_src and ']' in raw_src:
+                    try: # Add try-except for safety during debug
+                        base, idx_str = raw_src.split('[')
+                        idx = int(idx_str.rstrip(']'))
+                        arr = data.get(base)
+                        if isinstance(arr, (list, tuple)) and len(arr) > idx:
+                            val = arr[idx]
+                        else:
+                            pass # Ignore parsing errors silently for now
+                    except Exception as e:
+                        pass # Ignore parsing errors silently for now
+                # Handle direct sources like temp_bmp
+                else:
+                    val = data.get(raw_src)
+                
+                # Append value if found
+                if val is not None:
+                    series = chart_data["series"]
                     if series.count() >= max_points:
-                        # быстро удаляем первые лишние точки
                         remove_cnt = series.count() - max_points + 1
                         series.removePoints(0, remove_cnt)
+                    series.append(series.count(), val)
+                    current_count = series.count()
 
-                    # Add new point
-                    series.append(series.count(), value)
-
-                    # + Обновляем историю данных
-                    history = self.data_history.get(name, [])
-                    history.append(value)
-                    # Ограничиваем количество сохраненных точек
-                    if len(history) > max_points * 3:
-                        history = history[-max_points*3:]
-                    self.data_history[name] = history
-
-                    # Auto-scale Y axis based on current value
-                    self.auto_scale_y_axis(name, [value])
-
-            # Update index
-            self.indexes[name] = index + 1
-
-            # ➕ Скользящее окно: показываем только последние max_points точек
-            if chart_data.get("multi_axis", False):
-                cnt = chart_data["series"][0].count()
-            else:
-                cnt = chart_data["series"].count()
-            start = max(0, cnt - max_points)
-            end   = cnt + 5
-            x_axis.setRange(start, end)
-
-            # после всех series операций — разблокировать
-            chart_view.setUpdatesEnabled(True)
+                    # Update history and autoscale
+                    hist = self.data_history.setdefault(name, [])
+                    hist.append(val)
+                    max_hist = max_points * 3
+                    if len(hist) > max_hist:
+                        hist[:] = hist[-max_hist:]
+                    self.auto_scale_y_axis(name, [val]) # Autoscale based on the single new value
+            
+            # --- Update X-axis and repaint (common for both types if data was added) ---
+            if current_count > 0: # Only update axis if points were added
+                x_axis.setRange(max(0, current_count - max_points), current_count + 5) # Use current_count
+                # Advance index counter (useful for debugging or future features)
+                self.indexes[name] = self.indexes.get(name, 0) + 1
+            
+            # Re-enable updates and repaint the view
+            try:
+                chart_view.setUpdatesEnabled(True)
+            except RuntimeError:
+                pass # View might be closed
             chart_view.update()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Refresh all chart views when the page is shown
+        # Use QTimer.singleShot to ensure updates happen after the event loop is processed
+        def refresh_charts():
+            for info in self.charts.values():
+                try:
+                    if info.get("view"): info["view"].update()
+                except Exception as e:
+                    print(f"[GraphsPage] Error refreshing chart in showEvent: {e}")
+        QTimer.singleShot(0, refresh_charts)
+
 import numpy as np
 def load_mesh_obj(filename: str, max_faces: int = 1000) -> MeshData:
     """
@@ -1777,7 +1951,6 @@ class LogPage(QWidget):
             # Запускаем фоновый поток для архивации
             self.add_log_message(f"[{datetime.datetime.now()}] Запуск экспорта ZIP...")
             if not os.path.isdir("log"):
-                self.add_log_message(f"[ERROR] Log directory missing: log")
                 return
             self._export_thread = ExportLogsThread(log_dir="log")
             self._export_thread.finished.connect(self._on_export_finished)
@@ -2261,30 +2434,107 @@ class Notification(QWidget):
             self._fade_out_anim.start()
         QTimer.singleShot(duration, start_fade_out)
 
-# === ГЛАВНОЕ ОКНО ===
-class MainWindow(QMainWindow):
+class MapPage(QWidget):
+    """Отдельная вкладка с картой и возможностью пан/зум."""
     def __init__(self):
         super().__init__()
+        # Layout
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10,10,10,10)
+        # QML-карта
+        self.map_widget = QQuickWidget()
+        self.map_widget.setResizeMode(QQuickWidget.SizeRootObjectToView)
+        qml_path = os.path.join(os.getcwd(), "MapView.qml")
+        self.map_widget.setSource(QUrl.fromLocalFile(qml_path))
+        # Растяжение и минимум по высоте
+        self.map_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.map_widget.setMinimumHeight(400)
+        layout.addWidget(self.map_widget)
+        # Root-объект QML для управления из Python
+        self.map_root = self.map_widget.rootObject()
+
+    def set_worker(self, worker):
+        """Подписываем GPS-данные на обновление карты."""
+        self.worker = worker
+        worker.data_ready.connect(self.on_map_data)
+
+    @Slot(dict)
+    def on_map_data(self, data):
+        """Обновляем центр карты при приходе новых координат."""
+        print(f"[DBG MapPage] on_map_data received: {data}") # DEBUG 1
+        lat, lon, _ = data.get("gps", (0,0,0))
+        gps_fix = data.get("gps_fix", 0)
+        print(f"[DBG MapPage] Extracted lat={lat}, lon={lon}, fix={gps_fix}") # DEBUG 2
+        # Check if fix is valid (>0) and coordinates are non-zero (or at least one is non-zero)
+        # if data.get("gps_fix", 0) > 0 and (lat or lon): # Old line
+        if gps_fix > 0 and (lat != 0.0 or lon != 0.0): # More explicit check for non-zero coords
+            print(f"[DBG MapPage] Condition met (fix > 0 and lat/lon != 0). Setting properties...") # DEBUG 3
+            # Здесь предполагается, что в QML у Map есть свойства 'latitude'/'longitude'
+            try:
+                # Check return value of setProperty
+                ret_lat = self.map_root.setProperty("latitude", lat)
+                ret_lon = self.map_root.setProperty("longitude", lon)
+                print(f"[DBG MapPage] setProperty results: lat_ok={ret_lat}, lon_ok={ret_lon}") # DEBUG 4
+                if not ret_lat or not ret_lon:
+                     print("[DBG MapPage] WARNING: setProperty failed! Check QML component properties.")
+            except Exception as e:
+                print(f"[DBG MapPage] Error calling setProperty: {e}") # DEBUG 5
+        else:
+             print(f"[DBG MapPage] Condition NOT met (fix={gps_fix}, lat={lat}, lon={lon})") # DEBUG 6
+
+# === ГЛАВНОЕ ОКНО ===
+class MainWindow(QMainWindow):
+    def __init__(self, config=None):
+        super().__init__()
+        self.config = config or {}
+        
+        # Буфер пакетов
+        self.buffered_packets = []
+        self.last_data = None
+        
         self.setWindowTitle("Telemetry Dashboard")
+        
         # ➕ Статус-бар и прогресс-бар симуляции
         self.setStatusBar(QStatusBar(self))
         self.progress_bar = QProgressBar(self)
         self.progress_bar.setRange(0, 100)
-        self.statusBar().addPermanentWidget(self.progress_bar)
-        self.resize(600,400)
+        self.progress_bar.setTextVisible(False) # Hide percentage text
+        self.progress_bar.setFixedHeight(8) # Make it slim
+        self.progress_bar.setStyleSheet(f"""
+            QProgressBar {{
+                background-color: {COLORS['bg_panel']};
+                border-radius: 4px;
+                border: 1px solid {COLORS['chart_grid']};
+            }}
+            QProgressBar::chunk {{
+                background-color: {COLORS['accent']};
+                border-radius: 3px;
+            }}
+        """)
+        self.progress_bar.hide() # Initially hidden
+        
+        # Optionally remove status bar if nothing else uses it
+        # self.setStatusBar(None) 
+        
+        self.resize(1200, 800)
+        # self.showMaximized() # Alternative: start maximized
         self.setWindowTitle("Главное окно")
-        self.setGeometry(100, 100, 600, 400)
+        # Remove placeholder label if it exists from previous versions
+        # label = QLabel("Главное окно приложения", self)
+        # label.setAlignment(Qt.AlignCenter)
+        # self.setCentralWidget(label)
         label = QLabel("Главное окно приложения", self)
         label.setAlignment(Qt.AlignCenter)
         self.setCentralWidget(label)
         apply_dark_theme(QApplication.instance())
 
         # Pages
-        self.tel      = TelemetryPage()
-        self.graphs   = GraphsPage()
+        self.tel     = TelemetryPage(self.config)
+        self.graphs   = GraphsPage(self.config)  # Передаем конфигурацию в GraphsPage
         self.log_page = LogPage()
         self.settings = SettingsPage()
         self.console  = ConsolePage()
+        self.map_page = MapPage()
 
         # Layout: sidebar + content
         main_widget = QWidget()
@@ -2305,7 +2555,8 @@ class MainWindow(QMainWindow):
             {"name": "Graphs",    "icon": "📈", "index": 1},
             {"name": "Logs",      "icon": "📝", "index": 2},
             {"name": "Settings",  "icon": "⚙️", "index": 3},
-            {"name": "Console",   "icon": "💻", "index": 4}
+            {"name": "Console",   "icon": "💻", "index": 4},
+            {"name": "Map",       "icon": "🗺️", "index": 5}
         ]
         self.nav_buttons = []
         for item in menu_items:
@@ -2335,14 +2586,16 @@ class MainWindow(QMainWindow):
             self.nav_buttons.append(btn)
             sidebar_layout.addWidget(btn)
 
+        sidebar_layout.addStretch(1) # Add stretch before version/progress
         # ➕ версия приложения внизу боковой панели
-        ver_lbl = QLabel(f"Version {APP_VERSION}")
+        ver_lbl = QLabel(f"Version {APP_VERSION} Beta")
         ver_lbl.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 8pt;")
         ver_lbl.setAlignment(Qt.AlignCenter)
         sidebar_layout.addWidget(ver_lbl)
+        # Add progress bar below version
+        sidebar_layout.addWidget(self.progress_bar)
 
-        self.nav_buttons[0].setChecked(True)
-        sidebar_layout.addStretch()
+        self.nav_buttons[0].setChecked(True) # Check first item after adding all widgets
         main_layout.addWidget(sidebar)
 
         # заставляем сначала занять весь доступный space, потом QStackedWidget
@@ -2369,7 +2622,7 @@ class MainWindow(QMainWindow):
         # делаем стек и страницы прозрачными, чтобы QQuickWidget-градиент был за ними
         self.stack = QStackedWidget(content_area)
         self.stack.setAttribute(Qt.WA_TranslucentBackground)
-        for page in (self.tel, self.graphs, self.log_page, self.settings, self.console):
+        for page in (self.tel, self.graphs, self.log_page, self.settings, self.console, self.map_page):
             page.setAttribute(Qt.WA_TranslucentBackground)
             self.stack.addWidget(page)
         grid.addWidget(self.stack, 0, 0)
@@ -2381,13 +2634,11 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(main_widget)
 
-        # Telemetry worker
-        self.worker = TelemetryWorker("COM3", 9600)
+        # Telemetry worker — передаём сначала config, потом порт и baudrate
+        self.worker = TelemetryWorker(self.config, "COM3", 9600)
 
         # Буфер пакетов и таймер для отложенного UI-обновления
-        self.packet_buffer = deque(maxlen=100)  # хранить только 100 самых свежих пакетов
-        self.last_data = None
-        self.ui_timer      = QTimer(self)
+        self.ui_timer = QTimer(self)
         self.ui_timer.timeout.connect(self.flush_buffered_packets)
         self.ui_timer.start(50)  # обновлять UI не чаще чем раз в 50 ms
 
@@ -2397,12 +2648,16 @@ class MainWindow(QMainWindow):
             self.tel.pause_btn.setText("⏸ Пауза"),
             self.tel.pause_btn.setEnabled(False)
         ))
-        self.worker.sim_ended.connect(lambda: self.packet_buffer.clear())
+        self.worker.sim_ended.connect(lambda: self.buffered_packets.clear())
+        self.worker.sim_ended.connect(self._on_simulation_ended) # Connect sim end to hide progress
 
         self.tel.set_worker(self.worker)
-        self.worker.data_ready.connect(self.packet_buffer.append)
+        self.worker.data_ready.connect(self._on_data_ready)  # Используем _on_data_ready вместо прямого append
         self.worker.log_ready.connect(self.log_page.add_log_message)
+        self.map_page.set_worker(self.worker)
         self.worker.error_crc.connect(QApplication.beep)
+        # Connect progress signal
+        self.worker.simulation_progress.connect(self._on_simulation_progress)
 
         # Сначала сохраняем настройки, без подключённых слотов — чтобы не было всплывашек на старте
         self.settings.save_settings()
@@ -2456,6 +2711,9 @@ class MainWindow(QMainWindow):
         sc_profile = QShortcut(QKeySequence("Ctrl+I"), self)
         sc_profile.activated.connect(self.print_profile)
 
+        # теперь действительно обновляем маленькие графики в TelemetryPage
+        self.worker.data_ready.connect(self.tel.update_values)
+
     def print_profile(self):
         import tracemalloc
         tracemalloc.start()
@@ -2486,21 +2744,27 @@ class MainWindow(QMainWindow):
             b.setChecked(False)
         btn.setChecked(True)
         self.stack.setCurrentIndex(idx)
-        self.progress_bar.setVisible(idx == 0)
+        # Show progress bar only when Telemetry tab (index 0) is active
+        is_telemetry_tab = (idx == 0)
+        is_sim_running = self.worker.sim_enabled and self.progress_bar.value() < self.progress_bar.maximum()
+        self.progress_bar.setVisible(is_telemetry_tab and is_sim_running)
 
         # все тяжёлые вещи — через QTimer.singleShot(0,…)
         QTimer.singleShot(0, self._start_simulation)
 
     def _start_simulation(self):
-        print("[UI] _start_simulation triggered")
         # 1) снимем паузу
         self.worker.resume()
         # 2) сбросим UI-буфер
-        self.packet_buffer.clear()
+        self.buffered_packets.clear()
         # 3) очистим графики
         #self.graphs.reset_charts()
         # 4) деактивируем кнопку Pause до начала прихода данных
         self.tel.pause_btn.setEnabled(False)
+        # Reset progress bar, but don't show it yet.
+        # It will become visible in _on_simulation_progress when data arrives.
+        if self.worker.sim_enabled: # Reset only if sim mode is on
+            self.progress_bar.reset() # Reset progress on start
 
     def closeEvent(self, event):
         # save graph layout
@@ -2513,16 +2777,29 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def flush_buffered_packets(self):
-        if self.packet_buffer:
+        # Создадим локальную копию буфера и очистим оригинал,
+        # чтобы избежать повторной обработки одних и тех же данных
+        packets = list(self.buffered_packets)
+        self.buffered_packets.clear()
+        
+        # Если страница графиков активна - обновим графики
+        if hasattr(self, 'graphs') and self.graphs is not None:
+            for p in packets:
+                try:
+                    self.graphs.update_charts(p)
+                except Exception as e:
+                    print(f"[UI] flush_buffered_packets error: {e}")
+        
+        # Если страница телеметрии активна - обновим её ТОЛЬКО последним пакетом
+        if packets and hasattr(self, 'tel') and self.tel is not None:
             try:
-                data = self.packet_buffer.pop()
-                print(f"[UI] Got telemetry: {data}")
-                self.packet_buffer.clear()
-                self.last_data = data
-                self.tel.update_values(data)
-                self.graphs.update_charts(data)
+                self.tel.update_values(packets[-1]) # Use only the last packet
             except Exception as e:
-                print(f"[UI] flush_buffered_packets error: {e}")
+                print(f"[UI] flush_buffered_packets error (telemetry): {e}")
+        
+        # Также обновляем последние данные
+        if packets:
+            self.last_data = packets[-1]
 
     @Slot(bool, str)
     def on_simulator_changed(self, enabled: bool, filepath: str):
@@ -2541,12 +2818,30 @@ class MainWindow(QMainWindow):
             return
         # 3) Подготавливаем UI и запускаем симуляцию
         QTimer.singleShot(0, self._start_simulation)
+        # Visibility is now handled by on_nav_click and _on_simulation_progress
+        # Hide immediately if simulation is turned OFF
+        if not enabled:
+            self.progress_bar.hide()
+            self.progress_bar.reset()
 
     @Slot(int, int)
     def _on_simulation_progress(self, pos: int, total: int):
         """Обновляем прогресс-бар в процентах."""
         pct = int(pos * 100 / total) if total else 0
         self.progress_bar.setValue(pct)
+        # Show the progress bar ONLY if the telemetry tab is active
+        if self.stack.currentIndex() == 0:
+            self.progress_bar.show()
+
+    # Add a new slot to handle simulation end signal
+    @Slot()
+    def _on_simulation_ended(self):
+        """Слот, вызываемый при завершении имитации."""
+        print("[UI] Simulation ended signal received.")
+        self.progress_bar.hide()
+        self.progress_bar.reset()
+        # Optionally notify user
+        # self.notify("Имитация завершена", "info")
 
     @Slot()
     def toggle_pause_shortcut(self):
@@ -2639,8 +2934,16 @@ class MainWindow(QMainWindow):
             self.console.write_response("UDP disabled")
             return
         if cmd == "ping":
-            # взять задержку из системного монитора
-            self.console.write_response(self.graphs.lat_label.text())
+            # Выводим время последних полученных данных если доступно
+            if hasattr(self, 'worker') and hasattr(self.worker, 'last_data_time'):
+                last = self.worker.last_data_time
+                if last:
+                    lat = time.time() - last
+                    self.console.write_response(f"UDP Latency: {lat:.2f}s")
+                else:
+                    self.console.write_response("UDP Latency: N/A")
+            else:
+                self.console.write_response("UDP Latency: N/A")
             return
         if cmd == "sensor info":
             if self.last_data:
@@ -2669,9 +2972,8 @@ class MainWindow(QMainWindow):
 
         # version
         if cmd == "version":
-            self.console.write_response("Grib Telemetry Dashboard v2.1 — program 'grib'")
+            self.console.write_response(f"Grib Telemetry Dashboard v{APP_VERSION} — program 'Norfa'")
             return
-
         # pause/resume without data-check
         if cmd in ("pause", "resume"):
             if cmd == "pause":
@@ -2694,8 +2996,28 @@ class MainWindow(QMainWindow):
 
         self.console.write_response(f"Unknown command: {cmd}")
 
+    def _on_data_ready(self, data):
+        """Обработка получения данных из TelemetryWorker."""
+        # Добавляем в буфер
+        self.buffered_packets.append(data)
+        
+        # Активируем кнопку паузы в телеметрии, если она есть и не активна
+        if hasattr(self, 'tel') and hasattr(self.tel, 'pause_btn') and not self.tel.pause_btn.isEnabled():
+            self.tel.pause_btn.setEnabled(True)
+
 if __name__ == "__main__":
+    # Force software OpenGL to avoid GPU "device removed" errors
+    QGuiApplication.setAttribute(Qt.AA_UseSoftwareOpenGL)
+    
+    # Загрузка конфигурации
+    try:
+        from tw_config import load_config
+        config = load_config()
+    except Exception as e:
+        print(f"Ошибка загрузки конфигурации: {e}")
+        config = {}  # Пустой конфиг на случай ошибки
+    
     app = QApplication(sys.argv)
-    splash = SplashScreen()
+    splash = SplashScreen(config)
     splash.show()
     sys.exit(app.exec())
