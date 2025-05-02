@@ -10,10 +10,16 @@ import socket
 import math
 import re
 import logging
+import json
 from typing import Optional, List, Tuple, Dict, Any, Union
 from collections import deque
 import configparser
 import webbrowser
+
+if getattr(sys, "frozen", False):
+    BASE_PATH = sys._MEIPASS
+else:
+    BASE_PATH = os.path.dirname(os.path.abspath(__file__))
 
 # 🌐 Настройка Qt API
 os.environ['QT_API'] = 'pyside6'
@@ -23,7 +29,7 @@ STABLE_VERSION = "2.3.0"
 GITHUB_REPO   = "NorfaRu/NorfaTelemtry"
 
 # ДЛЯ ТОГО ЧТОБЫ СОБРАТЬ ФАЙЛ В ТЕРМИНАЛЕ:
-# pyinstaller tw.py --onefile --windowed --icon=logo.ico --upx-dir=upx-5.0.0-win64
+# pyinstaller tw.py --onefile --windowed --icon=logo.ico --upx-dir=upx-5.0.0-win64 (после выполнения в скомпилированном виде 162 мб где-то так)
 
 from PySide6.QtCore import QPropertyAnimation, QObject, QMetaObject
 from PySide6.QtGui  import QGuiApplication
@@ -54,7 +60,7 @@ from qtpy.QtCore import (
 
 # 🎨 Qt GUI — Графика и Стили
 from qtpy.QtGui import (
-    QPalette, QColor, QFont, QPainter, QPen
+    QPalette, QColor, QFont, QPainter, QPen, QConicalGradient
 )
 
 from PySide6.QtGui import QSyntaxHighlighter, QTextCharFormat
@@ -66,7 +72,8 @@ from qtpy.QtCharts import (
 )
 
 # 📊 PyQtGraph — Быстрая 2D и 3D визуализация
-from pyqtgraph.opengl import MeshData
+# --- Удаляем зависимость от OpenGL --- 
+# from pyqtgraph.opengl import MeshData
 
 # === ПАРАМЕТРЫ ПАРСЕРА ===
 #DEBUG = False
@@ -405,34 +412,30 @@ class SpinnerWidget(QWidget):
         self.angle = 0
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._on_timeout)
-        self.timer.start(100)
+        self.timer.start(150)
         self.setFixedSize(radius * 2 + line_width * 2, radius * 2 + line_width * 2)
 
     def _on_timeout(self):
-        self.angle = (self.angle + 30) % 360
+        self.angle = (self.angle + 60) % 360 # <--- Увеличен шаг угла
         self.update()
 
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        rect = self.rect()
+        rect = self.rect().adjusted(self.line_width // 2, self.line_width // 2, -self.line_width // 2, -self.line_width // 2)
         center = rect.center()
-        p.translate(center)
-        # + Рисуем статичный круг
-        pen = QPen(QColor(COLORS["accent"]), self.line_width)
-        pen.setCapStyle(Qt.RoundCap)
-        p.setPen(pen)
-        p.setBrush(Qt.NoBrush)
-        p.drawEllipse(QRect(-self.radius, -self.radius, 2*self.radius, 2*self.radius))
 
-        # + Вращающаяся полоска
-        p.rotate(self.angle)
-        p.setPen(QPen(QColor(COLORS["accent"]), self.line_width))
-        pen = QPen(QColor(COLORS["accent"]), self.line_width)
+        # Создаем конический градиент
+        gradient = QConicalGradient(center, self.angle)
+        gradient.setColorAt(0.0, QColor(COLORS["accent"]))       # Начальный цвет (яркий)
+        gradient.setColorAt(0.75, QColor(COLORS["accent"]))      # Тот же цвет до 3/4 круга
+        gradient.setColorAt(1.0, QColor(COLORS["bg_panel"]))    # Плавный переход к фону в последней четверти
+
+        # Рисуем круг с градиентом
+        pen = QPen(gradient, self.line_width)
         pen.setCapStyle(Qt.RoundCap)
         p.setPen(pen)
-        p.drawArc(QRect(-self.radius, -self.radius, 2*self.radius, 2*self.radius),
-                  0 * 16, 90 * 16)  # 90° дуга
+        p.drawEllipse(rect) # Рисуем полный эллипс с градиентным пером
 
 class SplashScreen(QWidget):
     loading_step = Signal(str)      # сигнал для обновления текста
@@ -655,6 +658,9 @@ class TelemetryWorker(QThread):
     error_crc     = Signal()
     sim_ended     = Signal()
     simulation_progress = Signal(int, int)
+    # --- Добавляем сигнал для уведомлений --- (Добавлено)
+    notification_requested = Signal(str, str) # message, level
+
     def __init__(self, config, port_name="COM3", baud=9600, parent=None):
         super().__init__(parent)
         self.config = config
@@ -706,32 +712,38 @@ class TelemetryWorker(QThread):
     @Slot(bool, str)
     def update_simulation(self, enabled, file_path):
         """Настройки режима имитации из файла."""
-        # Закрываем старый дескриптор, если открыт
+
+        # Если пытаются включить симуляцию, но путь пустой — игнорируем запуск
+        if enabled and not file_path:
+            self.log_ready.emit("[SIM] Путь для симуляции не задан, режим имитации НЕ включён.")
+            return
+
+        # 1. Корректно закрываем предыдущий файл симуляции, если он был открыт
         if hasattr(self, 'sim_f') and self.sim_f:
             try:
                 self.sim_f.close()
-            except:
-                pass
-            self.sim_f = None
+                print("[SIM] Closed previous simulation file.") # Debug
+            except Exception as e:
+                print(f"[SIM] Error closing previous simulation file: {e}") # Debug
+        self.sim_f = None # Сбрасываем дескриптор в любом случае
 
-            """Переключить файл симуляции без гонок и I/O-блокировок."""
-            # остановить прежнюю симуляцию и закрыть файл, если открыт
-            print(f"[SIM] TelemetryWorker.update_simulation(enabled={enabled}, path={file_path})")
-            self.sim_enabled = False
-            if hasattr(self, 'sim_f') and self.sim_f:
-                try: self.sim_f.close()
-                except: pass
-                self.sim_f = None
+        # 2. Обновляем путь и статус симуляции (выполняется всегда)
+        self.sim_file_path = file_path
+        self.sim_enabled = enabled
 
-            # установить новый файл и включить симуляцию
-            self.sim_file_path = file_path
+        # 3. Пытаемся получить размер файла, если симуляция включена
+        self.sim_file_size = None
+        if enabled and file_path:
             try:
                 self.sim_file_size = os.path.getsize(file_path)
-            except:
-                self.sim_file_size = None
-            self.sim_enabled   = enabled
-            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self.log_ready.emit(f"[{ts}] Simulation set to {file_path}, enabled={enabled}")
+            except Exception as e:
+                self.log_ready.emit(f"[ERROR] Could not get size of simulation file {file_path}: {e}")
+
+        # 4. Логируем результат
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_msg = f"[{ts}] Simulation set: enabled={enabled}, path={file_path or 'None'}"
+        self.log_ready.emit(log_msg)
+        print(log_msg) # Дублируем в консоль для отладки
 
     @Slot(bool, str, int)
     def update_udp(self, enabled, host, port):
@@ -781,101 +793,213 @@ class TelemetryWorker(QThread):
         except: pass
 
     def run(self):
-        print("[SIM] Simulation thread started")
-        print(f"[SIM] run() started: initial sim_enabled={self.sim_enabled}, udp_enabled={self.udp_enabled}")
-        buf = b""
+        print("[WORKER] TelemetryWorker thread started") # Изменено
+        # Убираем вывод про SIM, он может сбивать с толку
+        # print(f"[SIM] run() started: initial sim_enabled={self.sim_enabled}, udp_enabled={self.udp_enabled}")
+        buf = b"" # Буфер для COM-порта и симуляции
         self.log_ready.emit(f"Telemetry thread started. Version {APP_VERSION}")
         self.log_ready.emit(f"Надёжная версия: {STABLE_VERSION}")
 
         while self._running:
-            try:
-                sim, udp = self.sim_enabled, self.udp_enabled
-                if sim and not udp:
-                    # Режим симуляции
-                    if not hasattr(self, 'sim_f') or self.sim_f is None:
+            # Если ни симуляция, ни UDP не включены, даём GUI отдохнуть
+            if not self.sim_enabled and not self.udp_enabled:
+                self.msleep(50)   # пауза 50 мс
+                continue
+            # Приоритет режима имитации
+            if self.sim_enabled:
+                if not hasattr(self, 'sim_f') or self.sim_f is None:
+                    try:
+                        #print(f"[SIM_DBG] Attempting to open: {self.sim_file_path}") # Debug
                         self.sim_f = open(self.sim_file_path, 'rb')
-                    rcv = self.sim_f.read(60)
-                    # Эмитим прогресс (текущая позиция и размер)
-                    pos = self.sim_f.tell()
-                    if hasattr(self, "sim_file_size") and self.sim_file_size:
-                        self.simulation_progress.emit(pos, self.sim_file_size)
+                        self.log_ready.emit(f"[SIM] Opened simulation file: {self.sim_file_path}")
+                        #print(f"[SIM_DBG] File opened successfully.") # Debug
+                    except Exception as e:
+                        self.log_ready.emit(f"[ERROR] Failed to open simulation file {self.sim_file_path}: {e}")
+                        self.sim_enabled = False # Отключаем симуляцию при ошибке
+                        self.msleep(1000)
+                        continue
+
+                try:
+                    rcv = self.sim_f.read(60) # Читаем бинарный блок
+                    #print(f"[SIM_DBG] Read {len(rcv)} bytes from file.") # Debug
                     if not rcv:
-                        self.log_ready.emit("[SIM] End of file reached")
+                        self.log_ready.emit("[SIM] End of simulation file reached")
                         self.sim_ended.emit()
-                        # отключаем симуляцию, закрываем файл и возвращаемся к началу цикла
                         self.sim_enabled = False
                         try: self.sim_f.close()
                         except: pass
                         self.sim_f = None
+                        self.msleep(50) # Короткая пауза перед след. циклом
                         continue
-                    # вместо time.sleep(1):
+                    # Эмитим прогресс (текущая позиция и размер)
+                    pos = self.sim_f.tell()
+                    if hasattr(self, "sim_file_size") and self.sim_file_size:
+                        self.simulation_progress.emit(pos, self.sim_file_size)
+                    # Имитируем задержку
+                    self.msleep(500) # Увеличим задержку (было 100)
+
+                    # Обрабатываем бинарный пакет из симуляции (старая логика)
+                    if self._paused:
+                        continue
+                    buf += rcv
+                    # --- Отладка Симуляции --- (Добавлено)
+                    #print(f"[SIM_DEBUG] Read {len(rcv)} bytes. Buffer size: {len(buf)}")
+                    while len(buf) >= 60:
+                         # ... (Старая логика обработки бинарного пакета buf) ...
+                         if buf[:2] == b"\xAA\xAA":
+                             # --- Отладка Симуляции --- (Добавлено)
+                             #print("[SIM_DEBUG] Found header 0xAAAA")
+                             chunk = buf[:60]
+                             try:
+                                 pkt = struct.unpack(self.packet_format, chunk)
+                                 #print(f"[SIM_DBG] Unpacked pkt: {pkt}") # Debug
+                             except struct.error:
+                                 # --- Отладка Симуляции --- (Добавлено)
+                                 #print("[SIM_DEBUG] Struct unpack error. Skipping byte.")
+                                 buf = buf[1:]
+                                 continue
+                             # --- Отладка Симуляции --- (Добавлено)
+                             calculated_crc = self.xor_block(chunk[:-1])
+                             received_crc = pkt[-1]
+                             #print(f"[SIM_DEBUG] CRC Check: Calculated={calculated_crc}, Received={received_crc}")
+                             if calculated_crc == received_crc:
+                                 # --- Отладка Симуляции --- (Добавлено)
+                                 #print("[SIM_DEBUG] CRC OK. Emitting data_ready.")
+                                 try:
+                                     # --- Восстанавливаем динамическое формирование data из self.fields --- (Изменено)
+                                     data = {}
+                                     # Используем self.fields, прочитанные из packet_structure
+                                     for field in self.fields:
+                                         field_name = field.get("name")
+                                         if not field_name:
+                                             continue # Пропускаем поле без имени
+                                         
+                                         field_type = field.get("type")
+                                         scale = field.get("scale", 1.0)
+                                         mask = field.get("mask")
+                                         indices = field.get("indices")
+                                         index = field.get("index")
+
+                                         # Обработка разных типов полей из конфига
+                                         if field_type == "vector3" and indices and len(indices) == 3:
+                                             try:
+                                                 val = [pkt[i] * scale for i in indices]
+                                                 data[field_name] = val
+                                             except IndexError:
+                                                 self.log_ready.emit(f"[ERROR][SIM] Invalid indices {indices} for packet length {len(pkt)} in field {field_name}")
+                                         elif field_type == "float" and index is not None:
+                                             try:
+                                                 val = pkt[index] * scale
+                                                 data[field_name] = val
+                                             except IndexError:
+                                                 self.log_ready.emit(f"[ERROR][SIM] Invalid index {index} for packet length {len(pkt)} in field {field_name}")
+                                         elif field_type == "int" and index is not None:
+                                             try:
+                                                 val = pkt[index]
+                                                 if mask is not None:
+                                                     val &= mask
+                                                 # --- Применяем scale --- (Добавлено)
+                                                 if scale != 1.0:
+                                                     val = val * scale
+                                                 data[field_name] = val
+                                             except IndexError:
+                                                 self.log_ready.emit(f"[ERROR][SIM] Invalid index {index} for packet length {len(pkt)} in field {field_name}")
+                                         elif index is not None: # Обработка uint/int/прочих по index, если тип не указан явно
+                                              try:
+                                                  # --- Читаем значение и применяем scale --- (Добавлено)
+                                                  val = pkt[index]
+                                                  # Получаем scale и для этого случая
+                                                  scale = field.get("scale", 1.0)
+                                                  if scale != 1.0:
+                                                      val = val * scale
+                                                  data[field_name] = val
+                                              except IndexError:
+                                                  self.log_ready.emit(f"[ERROR][SIM] Invalid index {index} for packet length {len(pkt)} in field {field_name}")
+                                         # Добавьте другие типы при необходимости (bytes и т.д.)
+                                     # --- Конец динамического формирования --- 
+                                     #print(f"[SIM_DBG] Parsed data dict: {data}") # Debug
+ 
+                                     # Отправляем готовые данные
+                                     self.data_ready.emit(data)
+                                     self.last_data_time = time.time()
+                                     if self.f_csv and not self.f_csv.closed:
+                                         self.f_csv.write(";".join(str(x) for x in pkt) + "\n")
+                                     if self.f_bin and not self.f_bin.closed:
+                                        self.f_bin.write(chunk)
+                                     buf = buf[60:]
+                                 except Exception as e:
+                                     self.log_ready.emit(f"[ERROR] Ошибка парсинга полей из config (симуляция): {e}") # Изменено сообщение
+                                     buf = buf[60:] # Пропускаем пакет, т.к. не смогли сформировать data
+                                     continue
+                             else:
+                                 self.error_crc.emit()
+                                 mw = QApplication.activeWindow()
+                                 # --- Используем сигнал вместо прямого вызова notify --- (Изменено)
+                                 self.notification_requested.emit("CRC mismatch (sim)", "warning")
+                                 buf = buf[1:] # Сдвигаем буфер НА ОДИН БАЙТ при CRC ошибке
+                         else:
+                             # --- Отладка Симуляции --- (Добавлено)
+                             #print(f"[SIM_DEBUG] Header not found at start of buffer (starts with {buf[:2]}). Skipping byte.")
+                             #print(f"[SIM_DEBUG] Header not found at start (starts with {buf[:2]}). Searching...")
+                             header_index = buf.find(b"\xAA\xAA")
+                             if header_index != -1:
+                                 #print(f"[SIM_DBG] Header found at index {header_index}.") # Debug
+                                 #print(f"[SIM_DEBUG] Header found at index {header_index}. Slicing buffer.")
+                                 # Заголовок найден, отбрасываем все байты перед ним
+                                 buf = buf[header_index:]
+                             else:
+                                 #print(f"[SIM_DBG] Header not found in current buffer (len={len(buf)}). Keeping last byte.") # Debug
+                                 #print("[SIM_DEBUG] Header not found in buffer. Keeping last byte.")
+                                 # Заголовок не найден во всем буфере.
+                                 # Сохраняем только последний байт, т.к. начало заголовка (0xAA)
+                                 # могло попасть в конец буфера и быть частью следующего чтения.
+                                 # Если оставить buf = b"", то пакеты со смещением будут потеряны.
+                                 buf = buf[-1:] 
+                                 break # Выходим из while, т.к. без заголовка пакет не собрать
+
+                except Exception as e:
+                    self.log_ready.emit(f"[ERROR] Ошибка во время симуляции: {e}")
                     self.msleep(1000)
-                else:
-                    # Режим UDP
+                    continue # Продолжаем цикл
+
+            # Режим UDP (если симуляция ВЫКЛЮЧЕНА)
+            elif self.udp_enabled:
+                # --- Добавлена проверка сокета --- (Добавлено)
+                if not self.udp_socket or self.udp_socket.fileno() == -1:
+                    self.log_ready.emit("[WARN] UDP включен, но сокет невалиден/закрыт. Пропускаем итерацию.")
+                    self.msleep(500) # Ждем немного перед следующей попыткой
+                    continue
+                # --- Конец проверки ---
+                try:
+                    # Ставим таймаут, чтобы не блокировать поток навсегда
+                    self.udp_socket.settimeout(0.1) # Таймаут 100 мс
+                    rcv, addr = self.udp_socket.recvfrom(4096) # Увеличим буфер для JSON
+                    # Если мы здесь, значит, данные пришли
+                    if self._paused:
+                        continue
                     try:
-                        rcv = self.udp_socket.recv(60*100)
+                        json_string = rcv.decode('utf-8')
+                        # --- Отладочный вывод --- (Добавлено)
+                        # print(f"[UDP_DEBUG] Received string: {json_string}")
+                        data = json.loads(json_string)
+                        # Отправляем распарсенный JSON
+                        self.data_ready.emit(data)
+                        self.last_data_time = time.time()
+                        self.log_ready.emit(f"[UDP] Получен пакет от {addr}") # Лог для отладки
+                    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                        self.log_ready.emit(f"[ERROR] Не удалось декодировать/распарсить JSON от {addr}: {e}")
                     except Exception as e:
-                        continue
-            except Exception as e:
-                continue
+                        self.log_ready.emit(f"[ERROR] Ошибка обработки UDP пакета от {addr}: {e}")
 
-            self.log_ready.emit(f"[DATA] Got {len(rcv)} bytes")
-            buf += rcv
+                except socket.timeout:
+                    pass # Таймаут - это нормально, просто нет данных
+                except Exception as e:
+                    # Логируем другие ошибки сокета, но не останавливаем поток
+                    self.log_ready.emit(f"[ERROR] Ошибка UDP сокета: {e}")
+                    self.msleep(100) # Короткая пауза перед след. попыткой
 
-            if self._paused:
-                continue
 
-            while len(buf) >= 60:
-                if buf[:2] == b"\xAA\xAA":
-                    chunk = buf[:60]
-                    try:
-                        pkt = struct.unpack(self.packet_format, chunk)
-                    except struct.error:
-                        buf = buf[1:]
-                        continue
-                    if self.xor_block(chunk[:-1]) == pkt[-1]:
-                        try:
-                            # Динамическое формирование данных на основе конфигурации
-                            data = {}
-                            for field in self.fields:
-                                if field["type"] == "vector3":
-                                    indices = field["indices"]
-                                    scale = field.get("scale", 1.0)
-                                    data[field["name"]] = [pkt[i]*scale for i in indices]
-                                elif field["type"] == "float":
-                                    index = field["index"]
-                                    scale = field.get("scale", 1.0)
-                                    data[field["name"]] = pkt[index]*scale
-                                elif field["type"] == "int" and "mask" in field:
-                                    index = field["index"]
-                                    mask = field["mask"]
-                                    data[field["name"]] = pkt[index] & mask
-                                elif field["type"] == "int":
-                                    index = field["index"]
-                                    data[field["name"]] = pkt[index]
-                                # ... другие типы ...
-                        
-                            # ... остальной код обработки ...
-                            self.data_ready.emit(data)
-                            self.last_data_time = time.time()
-                            if self.f_csv and not self.f_csv.closed:
-                                self.f_csv.write(";".join(str(x) for x in pkt) + "\n")
-                            self.f_bin.write(chunk)
-                            buf = buf[60:]
-                        except Exception as e:
-                            self.log_ready.emit(f"[ERROR] Ошибка парсинга пакета: {e}")
-                            buf = buf[60:]
-                            continue
-                    else:
-                        self.error_crc.emit()
-                        mw = QApplication.activeWindow()
-                        if hasattr(mw, "notify"):
-                            mw.notify("CRC mismatch", "warning")
-                        buf = buf[1:]
-                else:
-                    buf = buf[1:]
-
-                    # по выходу из цикла точно закроем
+        # --- Код завершения потока --- (остается как было)
         if getattr(self, 'sim_f', None):
             try: self.sim_f.close()
             except: pass
@@ -883,7 +1007,7 @@ class TelemetryWorker(QThread):
             try:
                 if fh and not fh.closed: fh.close()
             except: pass
-            self.log_ready.emit(f"[{datetime.datetime.now()}] TelemetryWorker stopped")
+        self.log_ready.emit(f"[{datetime.datetime.now()}] TelemetryWorker stopped")
 
     sim_ended = Signal()  # <-- новый сигнал
 
@@ -983,43 +1107,115 @@ class TelemetryPage(QWidget):
         super().__init__()
         self.config = config
         self._last_values = {}
-        
-        layout = QGridLayout(self)
-        layout.setSpacing(12)
-        
-        # --- кнопка Пауза/Возобновить ---
+
+        # --- Убираем общий стиль для страницы --- (Удалено)
+        # self.setStyleSheet(f""" ... ")
+
+        # 1. Основной вертикальный layout для страницы
+        page_layout = QVBoxLayout(self)
+        page_layout.setContentsMargins(10, 10, 10, 10) # Добавим отступы
+        page_layout.setSpacing(12)
+
+        # 2. Кнопка Пауза/Возобновить (добавляем в page_layout)
         self.pause_btn = QPushButton("⏸ Пауза")
         self.pause_btn.setEnabled(False)
         self.pause_btn.clicked.connect(self.toggle_pause)
-        layout.addWidget(self.pause_btn, 0, 0, 1, 2)
-        
+        page_layout.addWidget(self.pause_btn)
+
+        # 3. ScrollArea для карточек
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame) # Убрать рамку у scroll area
+        scroll_area.setStyleSheet("background: transparent;") # Прозрачный фон
+
+        # 4. Контейнер для GridLayout внутри ScrollArea
+        content_widget = QWidget()
+        # Возвращаем прозрачный фон контейнеру (Добавлено)
+        content_widget.setStyleSheet("background: transparent;") 
+
+        # 5. GridLayout для карточек (устанавливаем для content_widget)
+        grid_layout = QGridLayout(content_widget)
+        grid_layout.setSpacing(12)
+        grid_layout.setContentsMargins(0, 0, 0, 0) # Убираем внутренние отступы сетки
+
+        # 6. Связываем ScrollArea и content_widget
+        scroll_area.setWidget(content_widget)
+
+        # 7. Добавляем scroll_area в основной layout страницы
+        page_layout.addWidget(scroll_area)
+
         # --- динамические поля из config["telemetry_view"] ---
         self._label_widgets = {}
-        row = 1
+        row = 0
         col = 0
-        
-        for f in config.get("telemetry_view", {}).get("fields", []):
+        max_cols = 2 # Максимум колонок
+
+        for idx, f in enumerate(config.get("telemetry_view", {}).get("fields", [])):
             card = QFrame()
             card.setObjectName("card")
+            # Установим минимальную высоту для карточки, чтобы они не сжимались слишком сильно
+            card.setMinimumHeight(80)
             card_layout = QVBoxLayout(card)
             card_layout.setContentsMargins(10, 8, 10, 8)
-            
+
             title = QLabel(f.get("label", ""), objectName="title")
+            # --- Устанавливаем минимальную высоту для заголовка --- (Добавлено)
+            title.setMinimumHeight(20) # Подберите значение при необходимости
             value = QLabel("–", objectName="value")
-            
+
+            # Сделаем текст значения крупнее и жирнее
+            font = value.font()
+            font.setPointSize(14)
+            font.setBold(True)
+            value.setFont(font)
+
             value.setAlignment(Qt.AlignCenter)
             value.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            
-            card_layout.addWidget(title)
+
+            card_layout.addWidget(title, alignment=Qt.AlignHCenter) # Центрируем заголовок
             card_layout.addWidget(value)
-            
-            layout.addWidget(card, row, col)
+
+            # --- Задаем стиль КАЖДОЙ карточке напрямую --- (Добавлено)
+            card.setStyleSheet(f"""
+                QFrame {{ 
+                    background-color: {COLORS['bg_dark']}; 
+                    border-radius: 12px; 
+                    border: 1px solid {COLORS['chart_grid']};
+                }}
+                QLabel#title {{ 
+                    color: {COLORS['text_secondary']};
+                    font-size: 10pt; 
+                    font-weight: normal;
+                    padding-bottom: 4px;
+                    background: transparent; /* Убедимся, что у лейблов нет фона */
+                    border: none;
+                }}
+                 QLabel#value {{ 
+                    color: {COLORS['text_primary']};
+                    font-size: 11pt; /* Уменьшен шрифт (было 14pt) */
+                    font-weight: bold;
+                    background: transparent; /* Убедимся, что у лейблов нет фона */
+                    border: none;
+                }}
+            """)
+            # --- Конец задания стиля ---
+
+            # Добавляем карточку в grid_layout
+            grid_layout.addWidget(card, row, col)
             self._label_widgets[f["source"]] = (value, f)
-            
+
             # Move to next column or row
-            col = (col + 1) % 2
+            col = (col + 1) % max_cols
             if col == 0:
                 row += 1
+
+        # Добавляем растягивающийся элемент в конец сетки по вертикали,
+        # чтобы карточки не растягивались на всю высоту, если их мало
+        grid_layout.setRowStretch(row + 1, 1)
+        # --- Пересчет стиля после добавления виджетов --- (Добавлено)
+        content_widget.update()
+        content_widget.style().unpolish(content_widget)
+        content_widget.style().polish(content_widget)
 
     @Slot(dict)
     def update_values(self, data):
@@ -1074,6 +1270,15 @@ class TelemetryPage(QWidget):
     def set_worker(self, worker):
         self.worker = worker
 
+    @Slot()
+    def clear_values(self):
+        """Сбрасывает все значения на карточках телеметрии в '–'."""
+        for src, (label, field) in self._label_widgets.items():
+            label.setText("–")
+        # Также сбрасываем последнее сохраненное состояние
+        self._last_values = {}
+        print("[TelemetryPage] Values cleared.") # Для отладки
+
 class DraggableCard(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1122,8 +1327,14 @@ class GraphsPage(QWidget):
         super().__init__()
         self.config = config
         self._orig_pos = {}
-        # Map series names to QLineSeries for updates
-        self.series = {}
+        # --- Оптимизация: Карты для быстрого обновления --- (Добавлено)
+        # key=source_name (e.g. "accel_x"), value=list of (QLineSeries, index_or_None)
+        self._series_map: Dict[str, List[Tuple[QLineSeries, Optional[int]]]] = {}
+        # key=chart_name, value=dict with chart info (view, series list, axes, etc.)
+        self.charts: Dict[str, Dict] = {}
+        # key=chart_name or series_key, value=current_x_index
+        self.indexes = {}
+        # --- Конец оптимизации ---
         layout = QGridLayout(self)
         self._detached_windows = {}
         # === System Monitor ===
@@ -1144,7 +1355,7 @@ class GraphsPage(QWidget):
         from PySide6.QtCore import QTimer
         self.sys_timer = QTimer(self)
         self.sys_timer.timeout.connect(lambda: self._update_system_monitor(psutil))
-        self.sys_timer.start(1000)
+        self.sys_timer.start(3000)
         # Оборачиваем сетку в прокручиваемую область
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True) # Revert to standard behavior
@@ -1162,12 +1373,8 @@ class GraphsPage(QWidget):
         # Explicitly prevent stretching of subsequent columns
         self._grid_layout.setColumnStretch(2, 0)
 
-        # ежеминутный сброс, чтобы QLineSeries/ QSplineSeries не росли в C++
-        self._cleanup_timer = QTimer(self)
-        self._cleanup_timer.timeout.connect(self.reset_charts)
-        self._cleanup_timer.start(60000)
-
         # Dictionary to store all chart views and series
+        # --- Оптимизация: Карты для быстрого обновления --- (Добавлено)
         self.charts = {}
         self.indexes = {}
         self.data_points = {}  # Store maximum points to display
@@ -1212,10 +1419,10 @@ class GraphsPage(QWidget):
             chart_name = cfg.get("name")
             if chart_name in self._loaded_layout:
                 pos = self._loaded_layout[chart_name]
-                print(f"[GraphsPage] Using saved position {pos} for '{chart_name}'") # Debug print
+                #print(f"[GraphsPage] Using saved position {pos} for '{chart_name}'") # Debug print
             else:
                 pos = cfg.get("position", [0, 0]) # Default position from config
-                print(f"[GraphsPage] Using default position {pos} for '{chart_name}'") # Debug print
+                #print(f"[GraphsPage] Using default position {pos} for '{chart_name}'") # Debug print
             self._grid_layout.addWidget(wrapper, pos[0], pos[1], size[0], size[1])
 
     def reset_charts(self):
@@ -1324,7 +1531,7 @@ class GraphsPage(QWidget):
             ax_x.setMinorGridLineColor(QColor(COLORS["chart_grid"]))
             ax_y.setGridLineColor(QColor(COLORS["chart_grid"]))
             ax_y.setMinorGridLineColor(QColor(COLORS["chart_grid"]))
-            axis.setMinorGridLineColor(QColor("#2a2a2a"))
+            #axis.setMinorGridLineColor(QColor("#2a2a2a"))
             axis.setTitleFont(QFont("Segoe UI", 9))
             axis.setLabelsFont(QFont("Segoe UI", 8))
 
@@ -1376,11 +1583,17 @@ class GraphsPage(QWidget):
                 "multi_axis": True,
                 "y_range": y_range
             }
-            # Populate series mapping for updates
-            for i, s in enumerate(series_list):
-                key = f"{name}_{i}"
-                self.series[key] = s
-                self.indexes[key] = 0
+            # --- Оптимизация: Заполняем _series_map --- (Добавлено)
+            sources = config.get("sources", [])
+            if len(sources) == len(series_list):
+                for i, raw_src in enumerate(sources):
+                    # Парсим source один раз при инициализации
+                    base_src, src_idx = self._parse_source(raw_src)
+                    if base_src:
+                        if base_src not in self._series_map:
+                            self._series_map[base_src] = []
+                        self._series_map[base_src].append((series_list[i], src_idx))
+            # --- Конец оптимизации ---
         else:
             # For single value data
             series = QLineSeries()
@@ -1405,9 +1618,15 @@ class GraphsPage(QWidget):
                 "multi_axis": False,
                 "y_range": y_range
             }
-            # Populate series mapping for updates
-            self.series[name] = series
-            self.indexes[name] = 0
+            # --- Оптимизация: Заполняем _series_map --- (Добавлено)
+            raw_src = config.get("source")
+            if raw_src:
+                base_src, src_idx = self._parse_source(raw_src)
+                if base_src:
+                    if base_src not in self._series_map:
+                        self._series_map[base_src] = []
+                    self._series_map[base_src].append((series, src_idx))
+            # --- Конец оптимизации ---
 
         # Create chart view with enhanced rendering
         chart_view = QChartView(chart)
@@ -1450,6 +1669,22 @@ class GraphsPage(QWidget):
         # ➕ Запомним исходный диапазон Y сразу при создании
         self.default_y_ranges[name] = tuple(y_range)
         return wrapper
+
+    # --- Оптимизация: Хелпер для парсинга source --- (Добавлено)
+    def _parse_source(self, raw_src: str) -> Tuple[Optional[str], Optional[int]]:
+        """Парсит строку вида "name[index]" или "name"."""
+        if '[' in raw_src and ']' in raw_src:
+            try:
+                base, idx_str = raw_src.split('[')
+                idx = int(idx_str.rstrip(']'))
+                return base, idx
+            except ValueError:
+                print(f"[GraphsPage] Warning: Could not parse source index: {raw_src}")
+                return None, None # Ошибка парсинга индекса
+        elif raw_src:
+            return raw_src, None # Источник без индекса
+        else:
+            return None, None # Пустой источник
 
     def auto_scale_y_axis(self, name, data_values):
         """Automatically scale the Y axis based on current data values with improved logic"""
@@ -1666,102 +1901,86 @@ class GraphsPage(QWidget):
     @Slot(dict)
     def update_charts(self, data):
 
-        # Update each configured chart
-        for graph_config in self.config.get("graphs", []):
-            name = graph_config.get("name")
-            chart_data = self.charts.get(name)
-            if not chart_data:
-                continue
+        charts_to_update = set() # Собираем имена графиков, которые нужно обновить
 
-            chart_view = chart_data["view"]
-            # Disable updates temporarily to prevent flicker
+        # --- Оптимизация: Используем _series_map для быстрого обновления --- (Изменено)
+        for key, value in data.items():
+            if key in self._series_map:
+                series_targets = self._series_map[key]
+                for series, index in series_targets:
+                    actual_value = None
+                    if index is not None: # Источник вида key[index]
+                        if isinstance(value, (list, tuple)) and len(value) > index:
+                            actual_value = value[index]
+                    else: # Прямой источник (key)
+                        actual_value = value
+
+                    if actual_value is not None:
+                        # Находим график, которому принадлежит серия (немного неэффективно, но лучше чем было)
+                        chart_name = None
+                        chart_info = None
+                        for name, info in self.charts.items():
+                            if info.get("multi_axis"):
+                                if series in info.get("series", []):
+                                    chart_name = name
+                                    chart_info = info
+                                    break
+                            elif info.get("series") == series:
+                                chart_name = name
+                                chart_info = info
+                                break
+
+                        if chart_name and chart_info:
+                            charts_to_update.add(chart_name)
+                            max_points = self.data_points.get(chart_name, 200) # TODO: Предзагрузить max_points в chart_info
+
+                            # Обновляем историю для автомасштаба (Исправлены отступы)
+                            hist = self.data_history.setdefault(chart_name, [])
+                            hist.append(actual_value)
+                            max_hist = max_points * 3
+                            if len(hist) > max_hist:
+                                hist[:] = hist[-max_hist:]
+
+                            # --- Добавляем точку с правильным X и обновляем индекс --- (Исправлены отступы)
+                            current_x_index = self.indexes.get(chart_name, 0)
+                            series.append(current_x_index, actual_value) # Используем индекс как X
+                            self.indexes[chart_name] = current_x_index + 1 # Инкрементируем индекс
+
+                            # --- Удаляем старые точки ПОСЛЕ добавления --- (Исправлены отступы)
+                            while series.count() > max_points:
+                                series.removePoints(0, 1) # Удаляем по одной самой старой точке
+
+        # --- Обновляем оси и перерисовываем только затронутые графики --- (Исправлены отступы)
+        for chart_name in charts_to_update:
+            chart_info = self.charts.get(chart_name)
+            if not chart_info: continue
+
+            chart_view = chart_info["view"]
             try:
                 chart_view.setUpdatesEnabled(False)
             except RuntimeError:
-                pass # View might be closed
+                continue # View might be closed
 
-            max_points = self.data_points.get(name, 200)
-            x_axis = chart_data["x_axis"]
-            current_count = 0
+            # Автомасштаб (используем данные из истории)
+            hist = self.data_history.get(chart_name, [])
+            # Масштабируем не на каждую точку, а, например, раз в 5 обновлений
+            if len(hist) % 5 == 0:
+                self.auto_scale_y_axis(chart_name, [hist[-1]])
+            #if hist: # Передаем только последние добавленные значения (или всю историю?)
+                #self.auto_scale_y_axis(chart_name, [hist[-1]] if hist else []) # Масштабируем по последнему значению?
+                # Или self.auto_scale_y_axis(chart_name, hist) # Масштабируем по всей истории?
 
-            # --- Multi-axis charts (use 'sources' key) --- 
-            if chart_data.get("multi_axis", False) and "sources" in graph_config:
-                values = []
-                # Extract each value from the sources list
-                for raw_src in graph_config["sources"]:
-                    val = None
-                    if '[' in raw_src and ']' in raw_src:
-                        base, idx_str = raw_src.split('[')
-                        idx = int(idx_str.rstrip(']'))
-                        arr = data.get(base)
-                        if isinstance(arr, (list, tuple)) and len(arr) > idx:
-                            val = arr[idx]
-                    else:
-                        val = data.get(raw_src)
-                    values.append(val if val is not None else 0)
-                
-                # Update series and enforce window
-                if len(values) == len(chart_data["series"]):
-                    for i, series in enumerate(chart_data["series"]):
-                        if series.count() >= max_points:
-                            remove_cnt = series.count() - max_points + 1
-                            series.removePoints(0, remove_cnt)
-                        series.append(series.count(), values[i])
-                    current_count = chart_data["series"][0].count()
-                
-                    # Update history and autoscale
-                    hist = self.data_history.setdefault(name, [])
-                    hist.extend(values)
-                    max_hist = max_points * 3 * len(values)
-                    if len(hist) > max_hist:
-                        hist[:] = hist[-max_hist:]
-                    # Autoscale based on the new values added
-                    self.auto_scale_y_axis(name, values)
-            
-            # --- Single-value charts (use 'source' key) ---
-            elif "source" in graph_config:
-                val = None
-                raw_src = graph_config["source"]
-                # Handle indexed sources like accel[0]
-                if '[' in raw_src and ']' in raw_src:
-                    try: # Add try-except for safety during debug
-                        base, idx_str = raw_src.split('[')
-                        idx = int(idx_str.rstrip(']'))
-                        arr = data.get(base)
-                        if isinstance(arr, (list, tuple)) and len(arr) > idx:
-                            val = arr[idx]
-                        else:
-                            pass # Ignore parsing errors silently for now
-                    except Exception as e:
-                        pass # Ignore parsing errors silently for now
-                # Handle direct sources like temp_bmp
-                else:
-                    val = data.get(raw_src)
-                
-                # Append value if found
-                if val is not None:
-                    series = chart_data["series"]
-                    if series.count() >= max_points:
-                        remove_cnt = series.count() - max_points + 1
-                        series.removePoints(0, remove_cnt)
-                    series.append(series.count(), val)
-                    current_count = series.count()
+            # Обновление оси X (можно оптимизировать, делать 1 раз)
+            x_axis = chart_info["x_axis"]
+            series_to_count = chart_info["series"]
+            # Берем первую серию для подсчета точек (предполагаем, что у всех серий графика одинаковое кол-во)
+            count_series = series_to_count[0] if chart_info.get("multi_axis") else series_to_count
+            current_total_count = count_series.count()
+            max_points_x = self.data_points.get(chart_name, 200)
+            # --- Используем текущий максимальный индекс X для расчета диапазона --- (Изменено)
+            current_max_x = self.indexes.get(chart_name, 0) # Получаем текущий МАКСИМАЛЬНЫЙ X
+            x_axis.setRange(max(0, current_max_x - max_points_x), current_max_x + 5)
 
-                    # Update history and autoscale
-                    hist = self.data_history.setdefault(name, [])
-                    hist.append(val)
-                    max_hist = max_points * 3
-                    if len(hist) > max_hist:
-                        hist[:] = hist[-max_hist:]
-                    self.auto_scale_y_axis(name, [val]) # Autoscale based on the single new value
-            
-            # --- Update X-axis and repaint (common for both types if data was added) ---
-            if current_count > 0: # Only update axis if points were added
-                x_axis.setRange(max(0, current_count - max_points), current_count + 5) # Use current_count
-                # Advance index counter (useful for debugging or future features)
-                self.indexes[name] = self.indexes.get(name, 0) + 1
-            
-            # Re-enable updates and repaint the view
             try:
                 chart_view.setUpdatesEnabled(True)
             except RuntimeError:
@@ -1779,42 +1998,6 @@ class GraphsPage(QWidget):
                 except Exception as e:
                     print(f"[GraphsPage] Error refreshing chart in showEvent: {e}")
         QTimer.singleShot(0, refresh_charts)
-
-import numpy as np
-def load_mesh_obj(filename: str, max_faces: int = 1000) -> MeshData:
-    """
-    Загружает Wavefront OBJ файл и возвращает MeshData.
-    Делает триангуляцию и динамическое упрощение до max_faces треугольников.
-    """
-    verts = []
-    faces = []
-
-    with open(filename, 'r') as f:
-        for line in f:
-            if line.startswith('v '):
-                parts = line.strip().split()[1:]
-                verts.append(tuple(map(float, parts)))
-            elif line.startswith('f '):
-                parts = line.strip().split()[1:]
-                idx = [int(p.split('/')[0]) - 1 for p in parts]
-                # Триангуляция (fan)
-                if len(idx) == 3:
-                    faces.append(idx)
-                else:
-                    for i in range(1, len(idx) - 1):
-                        faces.append([idx[0], idx[i], idx[i + 1]])
-
-    # Конвертация в numpy
-    vert_array = np.array(verts, dtype=np.float32)
-    face_array = np.array(faces, dtype=np.int32)
-
-    # --- Оптимизация: если граней слишком много, уменьшаем до max_faces ---
-    total = face_array.shape[0]
-    if total > max_faces:
-        step = math.ceil(total / max_faces)
-        face_array = face_array[::step]
-
-    return MeshData(vertexes=vert_array, faces=face_array)
 
 # === СТРАНИЦА ЛОГОВ + ЭКСПОРТ В ZIP ===
 class LogPage(QWidget):
@@ -1906,6 +2089,13 @@ class LogPage(QWidget):
         raw  = f"{datetime.datetime.now().strftime('%H:%M:%S')} {message}"
         html = f'<span style="color:{color};">{raw}</span>'
         # Сохраняем пару и добавляем в QTextEdit
+        # Сохраняем ошибочные уровни в error_list
+        if level in ("warning", "danger"):
+            self.error_list.append(raw)
+        #self.log_entries.append((raw, html))
+        # Сохраняем ошибочные уровни в error_list
+        if level in ("warning", "danger"):
+            self.error_list.append(raw)
         self.log_entries.append((raw, html))
         self.log_text.append(html)
         self.log_text.verticalScrollBar().setValue(
@@ -1936,7 +2126,6 @@ class LogPage(QWidget):
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(self.log_text.toPlainText())
-            self.add_log_message(f"[{datetime.datetime.now()}] Лог сохранен в {path}")
             msg = f"[{datetime.datetime.now()}] Лог сохранен в {path}"
             self.add_log_message(msg)
             from PySide6.QtWidgets import QApplication
@@ -1958,14 +2147,16 @@ class LogPage(QWidget):
 
     @Slot()
     def export_report(self):
-        """Экспорт всей сессии в HTML или PDF."""
+        """Экспорт всей сессии в HTML.""" # Обновлено описание
         from PySide6.QtWidgets import QFileDialog
-        from PySide6.QtGui import QTextDocument
+        # Удаляем ненужные импорты для PDF
+        # from PySide6.QtGui import QTextDocument
         from PySide6.QtCore import QBuffer
-        from PySide6.QtPrintSupport import QPrinter
+        # from PySide6.QtPrintSupport import QPrinter
 
-        path, fmt = QFileDialog.getSaveFileName(
-            self, "Export report", "", "HTML Files (*.html);;PDF Files (*.pdf)"
+        # Предлагаем сохранять только как HTML
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export report", "", "HTML Files (*.html)"
         )
         if not path:
             return
@@ -1988,7 +2179,7 @@ class LogPage(QWidget):
                 b64 = buf.data().toBase64().data().decode()
                 imgs[name] = b64
 
-        # HTML
+        # HTML - генерация остается прежней
         html = "<html><head><style>"
         html += "body{background:#1a1a1a;color:#ffffff;font-family:Segoe UI;}"
         html += ".card{background:#242424;padding:10px;margin:10px;border-radius:8px;}"
@@ -2000,24 +2191,20 @@ class LogPage(QWidget):
             html += f"<img src='data:image/png;base64,{b64}'/></div>"
         html += "</body></html>"
 
-        # Сохраняем HTML или PDF
-        if path.lower().endswith(".html"):
+        # Сохраняем HTML напрямую
+        try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(html)
             msg = f"HTML report saved to {path}"
-        else:
-            doc = QTextDocument()
-            doc.setHtml(html)
-            printer = QPrinter(QPrinter.HighResolution)
-            printer.setOutputFormat(QPrinter.PdfFormat)
-            printer.setOutputFileName(path)
-            doc.print_(printer)
-            msg = f"PDF report saved to {path}"
-
-        # Лог и уведомление (один раз)
-        self.add_log_message(f"[AUTO] {msg}")
-        if hasattr(mw, "notify"):
-            mw.notify("Report exported", "success")
+            # Лог и уведомление
+            self.add_log_message(f"[AUTO] {msg}")
+            if hasattr(mw, "notify"):
+                mw.notify("Report exported", "success")
+        except Exception as e:
+            msg = f"Failed to save HTML report: {e}"
+            self.add_log_message(f"[ERROR] {msg}")
+            if hasattr(mw, "notify") :
+                 mw.notify(msg, "danger")
 
     @Slot(str, bool, str)
     def _on_export_finished(self, archive: str, success: bool, error: str):
@@ -2156,7 +2343,6 @@ class SettingsPage(QWidget):
             QPushButton:pressed {{ background: {COLORS["accent"]}; }}
         """)
         self.save_btn.clicked.connect(self.save_settings)
-        layout.addWidget(self.save_btn)
         # --- Auto-save logs every N minutes ---
         # wrap into card
         auto_card = QFrame()
@@ -2184,6 +2370,7 @@ class SettingsPage(QWidget):
         v_reset.addWidget(self.reset_layout_btn, alignment=Qt.AlignCenter)
         layout.addWidget(reset_card)
         layout.addStretch()
+        layout.addWidget(self.save_btn)
     def save_settings(self):
         # UDP section
         self.cfg["UDP"] = {
@@ -2221,6 +2408,24 @@ class SettingsPage(QWidget):
         mw = QApplication.activeWindow()
         if hasattr(mw, "notify"):
             mw.notify("Settings saved", "success")
+
+        # --- Отправка уведомления на nazemkakom.py --- (Удалено)
+        # try:
+        #     # Отправляем уведомление на nazemkakom.py
+        #     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as notify_sock:
+        #         notify_sock.sendto(b"NEW_USER_CONFIGURED", ('127.0.0.1', self.CONTROL_PORT))
+        #         print(f"[Settings] Отправлено уведомление NEW_USER_CONFIGURED на 127.0.0.1:{self.CONTROL_PORT}")
+        #         # Логируем отправку в LogPage основной программы
+        #         if hasattr(mw, 'log_page'):
+        #             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        #             mw.log_page.add_log_message(f"[{timestamp}] [INFO] Отправлено уведомление наземке (порт {self.CONTROL_PORT}).")
+        # except Exception as e:
+        #     print(f"[Settings] Не удалось отправить уведомление на nazemkakom: {e}")
+        #     # Логируем ошибку в LogPage основной программы
+        #     if hasattr(mw, 'log_page'):
+        #          timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        #          # Убираем ссылку на self.CONTROL_PORT
+        #          mw.log_page.add_log_message(f"[{timestamp}] [WARNING] Не удалось отправить уведомление наземке: {e}")
 
     from PySide6.QtWidgets import QFileDialog
 
@@ -2444,7 +2649,7 @@ class MapPage(QWidget):
         # QML-карта
         self.map_widget = QQuickWidget()
         self.map_widget.setResizeMode(QQuickWidget.SizeRootObjectToView)
-        qml_path = os.path.join(os.getcwd(), "MapView.qml")
+        qml_path = os.path.join(BASE_PATH, "MapView.qml")
         self.map_widget.setSource(QUrl.fromLocalFile(qml_path))
         # Растяжение и минимум по высоте
         self.map_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -2461,26 +2666,27 @@ class MapPage(QWidget):
     @Slot(dict)
     def on_map_data(self, data):
         """Обновляем центр карты при приходе новых координат."""
-        print(f"[DBG MapPage] on_map_data received: {data}") # DEBUG 1
+        # --- Удаляем отладочный вывод --- (Удалено)
+        # print(f"[DBG MapPage] on_map_data received: {data}") # DEBUG 1
         lat, lon, _ = data.get("gps", (0,0,0))
         gps_fix = data.get("gps_fix", 0)
-        print(f"[DBG MapPage] Extracted lat={lat}, lon={lon}, fix={gps_fix}") # DEBUG 2
+        # print(f"[DBG MapPage] Extracted lat={lat}, lon={lon}, fix={gps_fix}") # DEBUG 2
         # Check if fix is valid (>0) and coordinates are non-zero (or at least one is non-zero)
         # if data.get("gps_fix", 0) > 0 and (lat or lon): # Old line
-        if gps_fix > 0 and (lat != 0.0 or lon != 0.0): # More explicit check for non-zero coords
-            print(f"[DBG MapPage] Condition met (fix > 0 and lat/lon != 0). Setting properties...") # DEBUG 3
+        if gps_fix > 0 and (lat != 0.0 or lon != 0.0) and self.map_root: # More explicit check for non-zero coords
+            # print(f"[DBG MapPage] Condition met (fix > 0 and lat/lon != 0). Setting properties...") # DEBUG 3
             # Здесь предполагается, что в QML у Map есть свойства 'latitude'/'longitude'
             try:
                 # Check return value of setProperty
                 ret_lat = self.map_root.setProperty("latitude", lat)
                 ret_lon = self.map_root.setProperty("longitude", lon)
-                print(f"[DBG MapPage] setProperty results: lat_ok={ret_lat}, lon_ok={ret_lon}") # DEBUG 4
+                # print(f"[DBG MapPage] setProperty results: lat_ok={ret_lat}, lon_ok={ret_lon}") # DEBUG 4
                 if not ret_lat or not ret_lon:
-                     print("[DBG MapPage] WARNING: setProperty failed! Check QML component properties.")
+                     print("[MapPage] WARNING: setProperty failed! Check QML component properties.") # Оставим предупреждение
             except Exception as e:
-                print(f"[DBG MapPage] Error calling setProperty: {e}") # DEBUG 5
-        else:
-             print(f"[DBG MapPage] Condition NOT met (fix={gps_fix}, lat={lat}, lon={lon})") # DEBUG 6
+                print(f"[MapPage] Error calling setProperty: {e}") # DEBUG 5 - Оставим ошибку
+        # else:
+             # print(f"[DBG MapPage] Condition NOT met (fix={gps_fix}, lat={lat}, lon={lon})") # DEBUG 6
 
 # === ГЛАВНОЕ ОКНО ===
 class MainWindow(QMainWindow):
@@ -2588,7 +2794,7 @@ class MainWindow(QMainWindow):
 
         sidebar_layout.addStretch(1) # Add stretch before version/progress
         # ➕ версия приложения внизу боковой панели
-        ver_lbl = QLabel(f"Version {APP_VERSION} Beta")
+        ver_lbl = QLabel(f"Version {APP_VERSION} release")
         ver_lbl.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 8pt;")
         ver_lbl.setAlignment(Qt.AlignCenter)
         sidebar_layout.addWidget(ver_lbl)
@@ -2615,7 +2821,8 @@ class MainWindow(QMainWindow):
         self.bg_anim.setAttribute(Qt.WA_TranslucentBackground)
         self.bg_anim.setStyleSheet("background: transparent;")
         self.bg_anim.setResizeMode(QQuickWidget.SizeRootObjectToView)
-        self.bg_anim.setSource(QUrl.fromLocalFile(os.path.join(os.getcwd(), "gradient.qml")))
+        grad = os.path.join(BASE_PATH, "gradient.qml")
+        self.bg_anim.setSource(QUrl.fromLocalFile(grad))
         grid.addWidget(self.bg_anim, 0, 0)
 
         # 2) основной стек страниц — поверх фона
@@ -2623,7 +2830,9 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget(content_area)
         self.stack.setAttribute(Qt.WA_TranslucentBackground)
         for page in (self.tel, self.graphs, self.log_page, self.settings, self.console, self.map_page):
-            page.setAttribute(Qt.WA_TranslucentBackground)
+            # Не делаем TelemetryPage прозрачной, чтобы ее дочерние стили работали
+            if page is not self.tel:
+                 page.setAttribute(Qt.WA_TranslucentBackground)
             self.stack.addWidget(page)
         grid.addWidget(self.stack, 0, 0)
 
@@ -2640,7 +2849,7 @@ class MainWindow(QMainWindow):
         # Буфер пакетов и таймер для отложенного UI-обновления
         self.ui_timer = QTimer(self)
         self.ui_timer.timeout.connect(self.flush_buffered_packets)
-        self.ui_timer.start(50)  # обновлять UI не чаще чем раз в 50 ms
+        self.ui_timer.start(100)  # обновлять UI не чаще чем раз в 50 ms
 
         # ➕ При окончании симуляции — чекаем графики и буфер
         self.worker.sim_ended.connect(self.graphs.reset_charts)
@@ -2650,26 +2859,27 @@ class MainWindow(QMainWindow):
         ))
         self.worker.sim_ended.connect(lambda: self.buffered_packets.clear())
         self.worker.sim_ended.connect(self._on_simulation_ended) # Connect sim end to hide progress
+        # --- Добавляем уведомление о завершении симуляции --- (Добавлено)
+        self.worker.sim_ended.connect(lambda: self.notify("Файл симуляции прочитан", "info"))
 
         self.tel.set_worker(self.worker)
-        self.worker.data_ready.connect(self._on_data_ready)  # Используем _on_data_ready вместо прямого append
+        self.worker.data_ready.connect(self._on_data_ready)  # Используем _on_data_ready для буферизации
         self.worker.log_ready.connect(self.log_page.add_log_message)
         self.map_page.set_worker(self.worker)
         self.worker.error_crc.connect(QApplication.beep)
         # Connect progress signal
         self.worker.simulation_progress.connect(self._on_simulation_progress)
+        # --- Подключаем сигнал уведомлений к слоту notify --- (Добавлено)
+        self.worker.notification_requested.connect(self.notify)
 
-        # Сначала сохраняем настройки, без подключённых слотов — чтобы не было всплывашек на старте
-        self.settings.save_settings()
-        # Теперь подключаем обработчики сигналов
-        self.settings.settings_changed.connect(self.worker.update_udp)
-        self.settings.settings_changed.connect(lambda *_: (
-            self.tel.pause_btn.setText("⏸ Пауза"),
-            self.tel.pause_btn.setEnabled(False)
-        ))
-        self.settings.simulator_changed.connect(self.on_simulator_changed)
+        # --- Подключаем сигналы изменения настроек к новому слоту --- 
+        self.settings.settings_changed.connect(self._on_settings_or_mode_changed)
+        # self.settings.simulator_changed.connect(self._on_settings_or_mode_changed) # Убираем дублирующий вызов
+
+        # --- Подключаем sim_ended к сбросу телеметрии --- 
+        self.worker.sim_ended.connect(self.tel.clear_values)
+
         # автосохранение логов
-        self.settings.save_settings()  # чтобы cfg обновился
         self.log_page.configure_auto_save(
             self.settings.auto_save_chk.isChecked(),
             self.settings.auto_save_spin.value()
@@ -2803,26 +3013,14 @@ class MainWindow(QMainWindow):
 
     @Slot(bool, str)
     def on_simulator_changed(self, enabled: bool, filepath: str):
-        """Обработка смены файла симуляции."""
-        print(f"[UI] MainWindow.on_simulator_changed(enabled={enabled}, path={filepath})")
-        # 1) Передаём новые параметры воркеру
-        self.worker.update_simulation(enabled, filepath)
-        # 🔧 DEBUG: подтверждение вызова слота MainWindow.on_simulator_changed
-        print(f"[UI] on_simulator_changed(enabled={enabled}, path='{filepath}')")
-        # 1) Передаём новые параметры воркеру через прямое присваивание и слот
-        self.worker.sim_enabled = enabled
-        self.worker.sim_file_path = filepath
-        # также вызываем слот для логирования
-        self.worker.update_simulation(enabled, filepath)
-        if not enabled:
-            return
-        # 3) Подготавливаем UI и запускаем симуляцию
-        QTimer.singleShot(0, self._start_simulation)
-        # Visibility is now handled by on_nav_click and _on_simulation_progress
-        # Hide immediately if simulation is turned OFF
-        if not enabled:
-            self.progress_bar.hide()
-            self.progress_bar.reset()
+        """Обработка смены файла симуляции - ТЕПЕРЬ ТОЛЬКО ЗАПУСКАЕТ СТАРТ."""
+        # Логика обновления worker'а и сброса UI перенесена в _on_settings_or_mode_changed
+        # Этот слот теперь нужен только для запуска симуляции, если она была включена
+        print(f"[UI] on_simulator_changed called (enabled={enabled})") # Debug
+        if enabled:
+            # Запускаем подготовку UI и старт симуляции (если она включена)
+            QTimer.singleShot(0, self._start_simulation)
+            # Сброс UI произойдет через _on_settings_or_mode_changed
 
     @Slot(int, int)
     def _on_simulation_progress(self, pos: int, total: int):
@@ -2840,6 +3038,7 @@ class MainWindow(QMainWindow):
         print("[UI] Simulation ended signal received.")
         self.progress_bar.hide()
         self.progress_bar.reset()
+        self._sim_running = False
         # Optionally notify user
         # self.notify("Имитация завершена", "info")
 
@@ -3005,6 +3204,55 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'tel') and hasattr(self.tel, 'pause_btn') and not self.tel.pause_btn.isEnabled():
             self.tel.pause_btn.setEnabled(True)
 
+    # --- Новый слот для обработки смены режима/настроек --- (Добавлено)
+    @Slot()
+    def _on_settings_or_mode_changed(self):
+         """Слот, вызываемый при сохранении настроек UDP или Симуляции."""
+         # Запоминаем состояние ДО изменения
+         udp_was_enabled = self.worker.udp_enabled
+         sim_was_enabled = self.worker.sim_enabled
+         print(f"[UI DBG] Before change: UDP={udp_was_enabled}, SIM={sim_was_enabled}") # Debug
+ 
+         # Получаем актуальные состояния из виджетов настроек
+         udp_now_enabled = self.settings.udp_enable.isChecked()
+         sim_now_enabled = self.settings.sim_enable.isChecked()
+         print(f"[UI DBG] After change (checkboxes): UDP={udp_now_enabled}, SIM={sim_now_enabled}") # Debug
+ 
+         # Обновляем worker'а (он сам разберется, что изменилось)
+         # Важно делать это до проверок ниже
+         self.worker.update_udp(udp_now_enabled, self.settings.udp_ip.text(), int(self.settings.udp_port.text() or 0))
+         self.worker.update_simulation(sim_now_enabled, self.settings.sim_file_path.text())
+
+         print(f"[UI] Mode changed check: UDP={udp_now_enabled}, SIM={sim_now_enabled}") # Debug
+
+         # --- Новое условие сброса: если переход из активного состояния в неактивное --- 
+         was_active = udp_was_enabled or sim_was_enabled
+         is_active_now = udp_now_enabled or sim_now_enabled
+         should_reset = was_active and not is_active_now
+         print(f"[UI DBG] State check: was_active={was_active}, is_active_now={is_active_now}, should_reset={should_reset}") # Debug
+ 
+         # Доп. условие: если включен UDP, но изменился хост/порт? (Пока не делаем, чтобы не сбрасывать при активном UDP)
+         # if udp_now_enabled and (self.worker.udp_host != self.settings.udp_ip.text() or ...):
+         if should_reset:
+             print("[UI] Resetting UI due to mode change...") # Debug
+             # Сбрасываем графики
+             self.graphs.reset_charts()
+             # Сбрасываем значения телеметрии
+             print("[UI DBG] Calling tel.clear_values()...") # Debug
+             self.tel.clear_values()
+             # Сбрасываем кнопку паузы
+             self.tel.pause_btn.setText("⏸ Пауза")
+             self.tel.pause_btn.setEnabled(False)
+             # Сбрасываем буфер пакетов
+             self.buffered_packets.clear()
+             # Сбрасываем прогресс бар симуляции
+             self._on_simulation_ended() # Используем этот слот для сброса прогресс бара
+
+         # --- Запускаем симуляцию, если она была включена --- (Исправлены отступы)
+         if sim_now_enabled:
+             print("[UI] Simulation enabled, queueing start...") # Debug
+             QTimer.singleShot(0, self._start_simulation)
+
 if __name__ == "__main__":
     # Force software OpenGL to avoid GPU "device removed" errors
     QGuiApplication.setAttribute(Qt.AA_UseSoftwareOpenGL)
@@ -3019,5 +3267,6 @@ if __name__ == "__main__":
     
     app = QApplication(sys.argv)
     splash = SplashScreen(config)
-    splash.show()
-    sys.exit(app.exec())
+    QTimer.singleShot(0, splash.show)
+    exit_code = app.exec() 
+    sys.exit(exit_code)
